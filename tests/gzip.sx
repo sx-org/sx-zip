@@ -1,0 +1,77 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    plain := "gzip gzip gzip gzip gzip gzip";
+    packed := mz.gzip_compress(plain, 6, gpa);
+    if packed.len < 18 or packed[0] != 0x1f or packed[1] != 0x8b or packed[2] != 8 {
+        gpa.dealloc_bytes(packed.ptr);
+        return 1;
+    }
+    got := mz.gzip_decompress(packed, 1000, gpa) catch (e) {
+        gpa.dealloc_bytes(packed.ptr);
+        return 1;
+    };
+    ok := mz.bytes_equal(got, plain);
+    gpa.dealloc_bytes(got.ptr);
+    if !ok { gpa.dealloc_bytes(packed.ptr); return 1; }
+
+    // Trailer corruption is a checksum failure, not partial output.
+    packed.ptr[packed.len - 8] = packed.ptr[packed.len - 8] ^ 1;
+    checksum_failed := false;
+    bad := mz.gzip_decompress(packed, 1000, gpa) catch (e) {
+        if e == error.ChecksumMismatch { checksum_failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if bad.ptr != null { gpa.dealloc_bytes(bad.ptr); }
+    gpa.dealloc_bytes(packed.ptr);
+    if !checksum_failed { return 1; }
+
+    // RFC 1952 concatenated members decode as the concatenation of payloads.
+    one := mz.gzip_compress("one", 6, gpa);
+    two := mz.gzip_compress("two", 6, gpa);
+    join := mz.ByteWriter.init(gpa);
+    join.put_bytes(one);
+    join.put_bytes(two);
+    both := join.take();
+    gpa.dealloc_bytes(one.ptr);
+    gpa.dealloc_bytes(two.ptr);
+    combined := mz.gzip_decompress(both, 1000, gpa) catch (e) {
+        gpa.dealloc_bytes(both.ptr);
+        return 1;
+    };
+    ok = mz.bytes_equal(combined, "onetwo");
+    gpa.dealloc_bytes(combined.ptr);
+
+    limited := false;
+    none := mz.gzip_decompress(both, 4, gpa) catch (e) {
+        if e == error.OutputLimit { limited = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if none.ptr != null { gpa.dealloc_bytes(none.ptr); }
+    gpa.dealloc_bytes(both.ptr);
+    if !ok or !limited { return 1; }
+
+    opts := mz.GzipOptions.{
+        mtime = 123456,
+        filename = "payload.txt",
+        comment = "sx fixture",
+        extra = "extra",
+        os = 3,
+        text = true,
+        header_crc = true,
+    };
+    annotated := mz.gzip_compress_options("metadata", opts, 9, gpa) catch (e) { return 1; };
+    annotated_plain := mz.gzip_decompress(annotated, 1000, gpa) catch (e) {
+        gpa.dealloc_bytes(annotated.ptr);
+        return 1;
+    };
+    ok = mz.bytes_equal(annotated_plain, "metadata");
+    gpa.dealloc_bytes(annotated_plain.ptr);
+    gpa.dealloc_bytes(annotated.ptr);
+    if !ok { return 1; }
+    if gpa.alloc_count != 0 { print("gzip leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("gzip smoke ok\n");
+    0
+}

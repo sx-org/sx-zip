@@ -1,0 +1,13 @@
+#import "modules/std/core.sx";
+raw_inflate :: #import "../modules/miniz/raw_inflate.sx";
+
+main :: () -> i32 {
+    // Raw stored DEFLATE stream for "abc".
+    packed : [8]u8 = .[1, 3, 0, 0xfc, 0xff, 'a', 'b', 'c'];
+    output : [3]u8 = ---;
+    made, consumed := raw_inflate.inflate_fixed(
+        string.{ ptr = @packed[0], len = packed.len },
+        string.{ ptr = @output[0], len = output.len },
+    ) catch (e) { return 1; };
+    if made == 3 and consumed == 8 and output[0] == 'a' and output[1] == 'b' and output[2] == 'c' then 0 else 2
+}

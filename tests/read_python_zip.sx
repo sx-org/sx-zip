@@ -1,0 +1,38 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    maybe_archive := fs.read_file("/tmp/python-miniz-interop.zip");
+    if maybe_archive == null { return 1; }
+    archive := maybe_archive!;
+    reader := mz.open_zip(archive) catch (e) {
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    };
+    if !mz.bytes_equal(reader.comment, "python archive comment") {
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    }
+    second_entry := reader.entry(1) catch (e) {
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    };
+    if !mz.bytes_equal(second_entry.comment, "python entry comment") or second_entry.extra.len != 7 {
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    }
+    stored := reader.extract_name("stored.txt", 1000, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    };
+    deflated := reader.extract_name("nested/deflated.txt", 1000, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(stored.ptr);
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    };
+    ok := mz.bytes_equal(stored, "from python") and mz.bytes_equal(deflated, "python python python python python");
+    context.allocator.dealloc_bytes(stored.ptr);
+    context.allocator.dealloc_bytes(deflated.ptr);
+    context.allocator.dealloc_bytes(archive.ptr);
+    if ok then 0 else 1
+}

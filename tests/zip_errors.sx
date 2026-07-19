@@ -1,0 +1,294 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+record :: (out: *mz.ByteWriter, ok: bool, reader: *mz.ZipReader) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(reader.take_last_error()));
+}
+
+record_writer :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+record_stream_writer :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+fail_zip_write :: (ctx: *void, bytes: string) -> bool {
+    false
+}
+
+load_reader :: (path: [:0]u8) -> (string, mz.ZipReader, bool) {
+    maybe_bytes := fs.read_file(path);
+    if maybe_bytes == null { return "", ---, false; }
+    bytes := maybe_bytes!;
+    reader := mz.open_zip(bytes) catch (e) {
+        context.allocator.dealloc_bytes(bytes.ptr);
+        return "", ---, false;
+    };
+    return bytes, reader, true;
+}
+
+record_open :: (out: *mz.ByteWriter, path: [:0]u8) -> bool {
+    maybe_bytes := fs.read_file(path);
+    if maybe_bytes == null { return false; }
+    bytes := maybe_bytes!;
+    open_error : mz.ZipError = .no_error;
+    opened := true;
+    empty_reader : mz.ZipReader = ---;
+    reader := mz.open_zip_with_error(bytes, @open_error) catch (e) {
+        opened = false;
+        empty_reader
+    };
+    out.put_u32le(if opened then 1 else 0);
+    out.put_u32le(mz.zip_error_code(open_error));
+    if opened { reader.end(); }
+    context.allocator.dealloc_bytes(bytes.ptr);
+    true
+}
+
+main :: () -> i32 {
+    out := mz.ByteWriter.init(context.allocator);
+    errors : [33]mz.ZipError = .[
+        .no_error, .undefined_error, .too_many_files, .file_too_large,
+        .unsupported_method, .unsupported_encryption, .unsupported_feature,
+        .failed_finding_central_dir, .not_an_archive,
+        .invalid_header_or_corrupted, .unsupported_multidisk,
+        .decompression_failed, .compression_failed,
+        .unexpected_decompressed_size, .crc_check_failed,
+        .unsupported_cdir_size, .alloc_failed, .file_open_failed,
+        .file_create_failed, .file_write_failed, .file_read_failed,
+        .file_close_failed, .file_seek_failed, .file_stat_failed,
+        .invalid_parameter, .invalid_filename, .buf_too_small,
+        .internal_error, .file_not_found, .archive_too_large,
+        .validation_failed, .write_callback_failed, .total_errors,
+    ];
+    i := 0;
+    while i < errors.len {
+        text := mz.zip_error_string(errors[i]);
+        out.put_u32le(mz.zip_error_code(errors[i]));
+        out.put_u32le(text.len);
+        out.put_bytes(text);
+        i += 1;
+    }
+    unknown := mz.zip_error_string_value(999);
+    out.put_u32le(999); out.put_u32le(unknown.len); out.put_bytes(unknown);
+
+    base, reader, loaded := load_reader("/tmp/miniz-zip-errors-base.zip");
+    if !loaded { out.deinit(); return 1; }
+    record(@out, true, @reader);
+    out.put_u32le(mz.zip_error_code(reader.set_last_error(.unsupported_method)));
+    out.put_u32le(mz.zip_error_code(reader.peek_last_error()));
+    out.put_u32le(mz.zip_error_code(reader.clear_last_error()));
+    out.put_u32le(mz.zip_error_code(reader.peek_last_error()));
+    out.put_u32le(mz.zip_error_code(reader.set_last_error(.crc_check_failed)));
+    out.put_u32le(mz.zip_error_code(reader.take_last_error()));
+    out.put_u32le(mz.zip_error_code(reader.peek_last_error()));
+
+    record(@out, reader.is_file_directory(99), @reader);
+    record(@out, reader.is_file_encrypted(99), @reader);
+    record(@out, reader.is_file_supported(99), @reader);
+    filename : [64]u8 = ---;
+    record(@out, reader.get_filename_into(99, string.{ ptr = @filename[0], len = filename.len }) != 0, @reader);
+    valid_entry := reader.entry(0) catch (e) { context.allocator.dealloc_bytes(base.ptr); out.deinit(); return 1; };
+    reader.clear_last_error();
+    stat_ok := true;
+    ignored_entry := reader.entry(99) catch (e) { stat_ok = false; valid_entry };
+    record(@out, stat_ok, @reader);
+    fixed : [1024]u8 = ---;
+    extract_ok := true;
+    ignored_size := reader.extract_into(99, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { extract_ok = false; 0 };
+    record(@out, extract_ok, @reader);
+    locate_ok := true;
+    ignored_index := reader.find("missing") catch (e) { locate_ok = false; -1 };
+    record(@out, locate_ok, @reader);
+    short_ok := true;
+    ignored_short := reader.extract_into(0, string.{ ptr = @fixed[0], len = 1 }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { short_ok = false; 0 };
+    record(@out, short_ok, @reader);
+    record(@out, reader.is_file_supported(0), @reader);
+    locate_flag_ok := true;
+    ignored_locate_flag := reader.find_options("dir/file.bin", "", mz.ZipLocateOptions.{}) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    locate_flag_ok = true;
+    ignored_locate_flag = reader.find_options("dir/file.bin", "", mz.ZipLocateOptions.{ case_sensitive = true }) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    locate_flag_ok = true;
+    ignored_locate_flag = reader.find_options("Dir/File.BIN", "", mz.ZipLocateOptions.{ case_sensitive = true }) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    locate_flag_ok = true;
+    ignored_locate_flag = reader.find_options("File.BIN", "", mz.ZipLocateOptions.{}) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    locate_flag_ok = true;
+    ignored_locate_flag = reader.find_options("File.BIN", "", mz.ZipLocateOptions.{ ignore_path = true }) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    locate_flag_ok = true;
+    ignored_locate_flag = reader.find_options("file.bin", "", mz.ZipLocateOptions.{ ignore_path = true, case_sensitive = true }) catch (e) { locate_flag_ok = false; -1 };
+    record(@out, locate_flag_ok, @reader);
+    validate_flags_ok := true;
+    reader.validate(false, false, false, context.allocator) catch (e) { validate_flags_ok = false; };
+    record(@out, validate_flags_ok, @reader);
+    validate_flags_ok = true;
+    reader.validate(true, false, false, context.allocator) catch (e) { validate_flags_ok = false; };
+    record(@out, validate_flags_ok, @reader);
+    validate_flags_ok = true;
+    reader.validate(false, true, false, context.allocator) catch (e) { validate_flags_ok = false; };
+    record(@out, validate_flags_ok, @reader);
+    validate_flags_ok = true;
+    reader.validate(true, true, false, context.allocator) catch (e) { validate_flags_ok = false; };
+    record(@out, validate_flags_ok, @reader);
+    record(@out, reader.end(), @reader);
+    record(@out, reader.end(), @reader);
+    context.allocator.dealloc_bytes(base.ptr);
+
+    method_bytes, method, loaded_method := load_reader("/tmp/miniz-zip-errors-method.zip");
+    if !loaded_method { out.deinit(); return 1; }
+    record(@out, method.is_file_supported(0), @method);
+    method_ok := true;
+    ignored_method := method.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { method_ok = false; 0 };
+    record(@out, method_ok, @method);
+    raw_ok := true;
+    ignored_raw := method.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{ compressed_data = true }, context.allocator) catch (e) { raw_ok = false; 0 };
+    record(@out, raw_ok, @method);
+    context.allocator.dealloc_bytes(method_bytes.ptr);
+
+    encrypted_bytes, encrypted, loaded_encrypted := load_reader("/tmp/miniz-zip-errors-encrypted.zip");
+    if !loaded_encrypted { out.deinit(); return 1; }
+    record(@out, encrypted.is_file_encrypted(0), @encrypted);
+    record(@out, encrypted.is_file_supported(0), @encrypted);
+    encrypted_ok := true;
+    ignored_encrypted := encrypted.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { encrypted_ok = false; 0 };
+    record(@out, encrypted_ok, @encrypted);
+    encrypted_raw_ok := true;
+    ignored_encrypted_raw := encrypted.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{ compressed_data = true }, context.allocator) catch (e) { encrypted_raw_ok = false; 0 };
+    record(@out, encrypted_raw_ok, @encrypted);
+    context.allocator.dealloc_bytes(encrypted_bytes.ptr);
+
+    strong_bytes, strong, loaded_strong := load_reader("/tmp/miniz-zip-errors-strong.zip");
+    if !loaded_strong { out.deinit(); return 1; }
+    record(@out, strong.is_file_encrypted(0), @strong);
+    record(@out, strong.is_file_supported(0), @strong);
+    strong_ok := true;
+    ignored_strong := strong.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { strong_ok = false; 0 };
+    record(@out, strong_ok, @strong);
+    strong_raw_ok := true;
+    ignored_strong_raw := strong.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{ compressed_data = true }, context.allocator) catch (e) { strong_raw_ok = false; 0 };
+    record(@out, strong_raw_ok, @strong);
+    context.allocator.dealloc_bytes(strong_bytes.ptr);
+
+    patched_bytes, patched, loaded_patched := load_reader("/tmp/miniz-zip-errors-patched.zip");
+    if !loaded_patched { out.deinit(); return 1; }
+    record(@out, patched.is_file_supported(0), @patched);
+    patched_ok := true;
+    ignored_patched := patched.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { patched_ok = false; 0 };
+    record(@out, patched_ok, @patched);
+    patched_validate_ok := true;
+    patched.validate_entry(0, true) catch (e) { patched_validate_ok = false; };
+    record(@out, patched_validate_ok, @patched);
+    context.allocator.dealloc_bytes(patched_bytes.ptr);
+
+    bad_local_bytes, bad_local, loaded_bad_local := load_reader("/tmp/miniz-zip-errors-bad-local.zip");
+    if !loaded_bad_local { out.deinit(); return 1; }
+    bad_local_ok := true;
+    ignored_bad_local := bad_local.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { bad_local_ok = false; 0 };
+    record(@out, bad_local_ok, @bad_local);
+    bad_local_validate_ok := true;
+    bad_local.validate_entry(0, true) catch (e) { bad_local_validate_ok = false; };
+    record(@out, bad_local_validate_ok, @bad_local);
+    context.allocator.dealloc_bytes(bad_local_bytes.ptr);
+
+    bad_crc_bytes, bad_crc, loaded_bad_crc := load_reader("/tmp/miniz-zip-errors-bad-crc.zip");
+    if !loaded_bad_crc { out.deinit(); return 1; }
+    bad_crc_ok := true;
+    ignored_bad_crc := bad_crc.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { bad_crc_ok = false; 0 };
+    record(@out, bad_crc_ok, @bad_crc);
+    bad_crc_validate_ok := true;
+    bad_crc.validate_entry(0, true) catch (e) { bad_crc_validate_ok = false; };
+    record(@out, bad_crc_validate_ok, @bad_crc);
+    context.allocator.dealloc_bytes(bad_crc_bytes.ptr);
+
+    bad_size_bytes, bad_size, loaded_bad_size := load_reader("/tmp/miniz-zip-errors-bad-size.zip");
+    if !loaded_bad_size { out.deinit(); return 1; }
+    bad_size_ok := true;
+    ignored_bad_size := bad_size.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { bad_size_ok = false; 0 };
+    record(@out, bad_size_ok, @bad_size);
+    bad_size_validate_ok := true;
+    bad_size.validate_entry(0, true) catch (e) { bad_size_validate_ok = false; };
+    record(@out, bad_size_validate_ok, @bad_size);
+    context.allocator.dealloc_bytes(bad_size_bytes.ptr);
+
+    bad_name_bytes, bad_name, loaded_bad_name := load_reader("/tmp/miniz-zip-errors-bad-name.zip");
+    if !loaded_bad_name { out.deinit(); return 1; }
+    bad_name_ok := true;
+    ignored_bad_name := bad_name.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, context.allocator) catch (e) { bad_name_ok = false; 0 };
+    record(@out, bad_name_ok, @bad_name);
+    bad_name_validate_ok := true;
+    bad_name.validate_entry(0, true) catch (e) { bad_name_validate_ok = false; };
+    record(@out, bad_name_validate_ok, @bad_name);
+    context.allocator.dealloc_bytes(bad_name_bytes.ptr);
+
+    tiny : [10]u8 = ---;
+    tiny_error : mz.ZipError = .no_error;
+    tiny_opened := true;
+    empty_reader : mz.ZipReader = ---;
+    tiny_reader := mz.open_zip_with_error(string.{ ptr = @tiny[0], len = tiny.len }, @tiny_error) catch (e) {
+        tiny_opened = false;
+        empty_reader
+    };
+    out.put_u32le(if tiny_opened then 1 else 0);
+    out.put_u32le(mz.zip_error_code(tiny_error));
+    if tiny_opened { tiny_reader.end(); }
+    if !record_open(@out, "/tmp/miniz-zip-errors-no-eocd.zip") or
+       !record_open(@out, "/tmp/miniz-zip-errors-multidisk.zip") or
+       !record_open(@out, "/tmp/miniz-zip-errors-masked.zip") or
+       !record_open(@out, "/tmp/miniz-zip-errors-bad-central.zip") {
+        out.deinit();
+        return 1;
+    }
+
+    writer := mz.ZipWriter.init(context.allocator);
+    record_writer(@out, true, @writer);
+    writer_ok := true;
+    writer.add("", "x", .store, 0) catch (e) { writer_ok = false; };
+    record_writer(@out, writer_ok, @writer);
+    writer_ok = true;
+    writer.add("/bad", "x", .store, 0) catch (e) { writer_ok = false; };
+    record_writer(@out, writer_ok, @writer);
+    writer_ok = true;
+    writer.add("level", "payload", .deflate, 11) catch (e) { writer_ok = false; };
+    record_writer(@out, writer_ok, @writer);
+    writer_ok = true;
+    writer.add("dir/", "x", .store, 0) catch (e) { writer_ok = false; };
+    record_writer(@out, writer_ok, @writer);
+    writer_finished := true;
+    writer_bytes := writer.finish() catch (e) { writer_finished = false; string.{ ptr = null, len = 0 } };
+    record_writer(@out, writer_finished, @writer);
+    if writer_bytes.ptr != null { context.allocator.dealloc_bytes(writer_bytes.ptr); }
+    writer_finished = true;
+    writer_bytes = writer.finish() catch (e) { writer_finished = false; string.{ ptr = null, len = 0 } };
+    record_writer(@out, writer_finished, @writer);
+    if writer_bytes.ptr != null { context.allocator.dealloc_bytes(writer_bytes.ptr); }
+    record_writer(@out, writer.end(), @writer);
+    record_writer(@out, writer.end(), @writer);
+
+    alignment_writer := mz.ZipWriter.init(context.allocator);
+    alignment_ok := true;
+    alignment_writer.set_alignment(3) catch (e) { alignment_ok = false; };
+    record_writer(@out, alignment_ok, @alignment_writer);
+    alignment_writer.deinit();
+
+    failing_sink := mz.ZipSink.{ ctx = null, write = fail_zip_write };
+    stream_writer := mz.ZipStreamWriter.init(failing_sink, context.allocator);
+    record_stream_writer(@out, true, @stream_writer);
+    stream_ok := true;
+    stream_writer.add("x", "x", .store, 0) catch (e) { stream_ok = false; };
+    record_stream_writer(@out, stream_ok, @stream_writer);
+    record_stream_writer(@out, stream_writer.end(), @stream_writer);
+    record_stream_writer(@out, stream_writer.end(), @stream_writer);
+
+    bytes := out.take();
+    ok := fs.write_file("/tmp/sx-zip-errors.bin", bytes);
+    context.allocator.dealloc_bytes(bytes.ptr);
+    if ok then 0 else 1
+}

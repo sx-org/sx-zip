@@ -1,0 +1,38 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+libc :: #import "modules/std/c.sx";
+
+PATH : [:0]u8 : "/tmp/sx-zip-inplace-partial.zip";
+RLimit :: struct { current: u64; maximum: u64; }
+limit_lib :: #library "c";
+getrlimit :: (resource: i32, limit: *RLimit) -> i32 extern limit_lib;
+setrlimit :: (resource: i32, limit: *RLimit) -> i32 extern limit_lib;
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    writer := mz.ZipWriter.init(gpa);
+    writer.add_options("base", "base-data", mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }) catch (e) { writer.deinit(); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); return 1; };
+    if !fs.write_file(PATH, archive) { gpa.dealloc_bytes(archive.ptr); return 1; }
+    limit : RLimit = ---;
+    if getrlimit(1, @limit) != 0 { gpa.dealloc_bytes(archive.ptr); return 1; }
+    limit.current = (archive.len + 10).(u64);
+    if setrlimit(1, @limit) != 0 { gpa.dealloc_bytes(archive.ptr); return 1; }
+    gpa.dealloc_bytes(archive.ptr);
+
+    zip_error : mz.ZipError = .undefined_error;
+    ok := mz.zip_add_to_file_in_place_with_error(
+        PATH, "new-entry",
+        "partial-write-payload-partial-write-payload-partial-write-payload",
+        @zip_error, mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }, gpa,
+    );
+    maybe := fs.read_file(PATH); if maybe == null { return 1; }
+    bytes := maybe!;
+    out := mz.ByteWriter.init(gpa);
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(zip_error));
+    out.put_u32le(bytes.len); out.put_bytes(bytes);
+    context.allocator.dealloc_bytes(bytes.ptr);
+    result := out.take(); made := libc.write(1, result.ptr, result.len);
+    gpa.dealloc_bytes(result.ptr);
+    if made == result.len and gpa.alloc_count == 0 then 0 else 1
+}

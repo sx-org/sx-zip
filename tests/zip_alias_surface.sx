@@ -1,0 +1,150 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+BASE_PATH : [:0]u8 : "/tmp/sx-zip-alias-base.zip";
+PREFIX_PATH : [:0]u8 : "/tmp/sx-zip-alias-prefix.bin";
+EXTRACT_PATH : [:0]u8 : "/tmp/sx-zip-alias-extract.bin";
+INPLACE_PATH : [:0]u8 : "/tmp/sx-zip-alias-inplace.zip";
+CFILE_PATH : [:0]u8 : "/tmp/sx-zip-alias-cfile.bin";
+RAW_PATH : [:0]u8 : "/tmp/sx-zip-alias-raw.bin";
+
+Sink :: struct { out: mz.ByteWriter; position: i64 = 0; }
+sink_write :: (ctx: *void, data: string) -> bool {
+    state : *Sink = xx ctx; state.out.put_bytes(data); state.position += data.len; true
+}
+
+blob :: (out: *mz.ByteWriter, data: string) { out.put_u32le(data.len); out.put_bytes(data); }
+
+file_blob :: (out: *mz.ByteWriter, path: [:0]u8) -> bool {
+    maybe := fs.read_file(path); if maybe == null { return false; }
+    data := maybe!; blob(out, data); context.allocator.dealloc_bytes(data.ptr); true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    writer := mz.ZipWriter.init(gpa);
+    writer.add_options("Dir/A.txt", "alias-surface-store", mz.ZipEntryOptions.{ method = .store, level = 0, comment = "note", ascii_filename = true }) catch (e) { writer.deinit(); out.deinit(); return 1; };
+    writer.add_options("b.bin", "alias-surface-deflate-alias-surface-deflate-alias-surface-deflate", mz.ZipEntryOptions.{ method = .deflate, level = 6, ascii_filename = true }) catch (e) { writer.deinit(); out.deinit(); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); out.deinit(); return 1; };
+    if !fs.write_file(BASE_PATH, archive) or !fs.write_file(PREFIX_PATH, "PREFIX!") or !fs.append_file(PREFIX_PATH, archive) { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+
+    maybe_file := fs.open_file(PREFIX_PATH, .read); if maybe_file == null { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    source_file := maybe_file!; if source_file.seek(7, .set) != 7 { source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    owned := mz.open_zip_handle(@source_file, archive.len, gpa) catch (e) { source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; };
+    out.put_u32le(1); out.put_u32le(5); out.put_u32le(7);
+    located := owned.reader.find_options("a.TXT", "note", mz.ZipLocateOptions.{ ignore_path = true }) catch (e) -1;
+    out.put_u32le(if located >= 0 then 1 else 0); out.put_u32le(located);
+    bad_located := owned.reader.find_options("A.txt", "bad", mz.ZipLocateOptions.{ ignore_path = true }) catch (e) -1;
+    out.put_u32le(if bad_located >= 0 then 1 else 0); out.put_u32le(0);
+    fixed : [256]u8 = ---;
+    made := owned.reader.extract_into(0, string.{ ptr = @fixed[0], len = 19 }, .{}, gpa) catch (e) 0;
+    out.put_u32le(if made == 19 then 1 else 0); out.put_u32le(mz.crc32(string.{ ptr = @fixed[0], len = 19 }));
+    made = owned.reader.extract_into(1, string.{ ptr = @fixed[0], len = 65 }, .{}, gpa) catch (e) 0;
+    out.put_u32le(if made == 65 then 1 else 0); out.put_u32le(mz.crc32(string.{ ptr = @fixed[0], len = 65 }));
+
+    maybe_created := fs.open_file(CFILE_PATH, .write); if maybe_created == null { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    cfile := maybe_created!; if cfile.write("OUT") != 3 { cfile.close(); owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    made = mz.zip_extract_to_handle(@owned.reader, 0, @cfile, .{}, 256, gpa) catch (e) 0; out.put_u32le(if made == 19 then 1 else 0);
+    made = mz.zip_extract_name_to_handle(@owned.reader, "b.bin", @cfile, .{}, 256, gpa) catch (e) 0; out.put_u32le(if made == 65 then 1 else 0);
+    if !cfile.close() or !file_blob(@out, CFILE_PATH) { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    maybe_raw := fs.open_file(RAW_PATH, .write); if maybe_raw == null { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    raw_file := maybe_raw!;
+    raw_ok := true; ignored_raw := mz.zip_extract_name_to_handle(@owned.reader, "b.bin", @raw_file, mz.ZipExtractOptions.{ compressed_data = true }, 256, gpa) catch (e) { raw_ok = false; 0 };
+    out.put_u32le(if raw_ok then 1 else 0);
+    if !raw_file.close() or !file_blob(@out, RAW_PATH) { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    made = mz.zip_extract_name_to_file(@owned.reader, "Dir/A.txt", EXTRACT_PATH, .{}, 256, gpa) catch (e) 0; out.put_u32le(if made == 19 then 1 else 0);
+    if !file_blob(@out, EXTRACT_PATH) { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    ignore_options := mz.ZipExtractOptions.{ locate = .{ ignore_path = true } };
+    made = mz.zip_extract_name_to_file(@owned.reader, "A.txt", EXTRACT_PATH, ignore_options, 256, gpa) catch (e) 0; out.put_u32le(if made == 19 then 1 else 0);
+    if !file_blob(@out, EXTRACT_PATH) { owned.deinit(); source_file.close(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    case_options := mz.ZipExtractOptions.{ locate = .{ ignore_path = true, case_sensitive = true } };
+    case_ok := true; ignored_case := mz.zip_extract_name_to_file(@owned.reader, "a.txt", EXTRACT_PATH, case_options, 256, gpa) catch (e) { case_ok = false; 0 };
+    out.put_u32le(if case_ok then 1 else 0); out.put_u32le(mz.zip_error_code(owned.reader.take_last_error()));
+    out.put_u32le(if owned.end() then 1 else 0); if !source_file.close() { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+
+    validation_error : mz.ZipError = .undefined_error;
+    valid_mem := mz.validate_zip_with_error(archive, @validation_error, false, false, false, gpa);
+    out.put_u32le(if valid_mem then 1 else 0); out.put_u32le(mz.zip_error_code(validation_error));
+    validation_error = .undefined_error;
+    valid_file := mz.validate_zip_file_with_error(BASE_PATH, @validation_error, 0, 0, false, false, false, gpa);
+    out.put_u32le(if valid_file then 1 else 0); out.put_u32le(mz.zip_error_code(validation_error));
+
+    user_sink := Sink.{ out = mz.ByteWriter.init(gpa) };
+    user_writer := mz.ZipStreamWriter.init(mz.ZipSink.{ ctx = xx @user_sink, write = sink_write }, gpa);
+    out.put_u32le(1);
+    user_ok := true; user_writer.add_options("u", "user", mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }) catch (e) { user_ok = false; };
+    out.put_u32le(if user_ok then 1 else 0);
+    finish_ok := true; user_writer.finish() catch (e) { finish_ok = false; };
+    out.put_u32le(if finish_ok then 1 else 0); out.put_u32le(if user_writer.end() then 1 else 0);
+    user_bytes := user_sink.out.take(); blob(@out, user_bytes); gpa.dealloc_bytes(user_bytes.ptr);
+
+    source := mz.open_zip(archive) catch (e) { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; };
+    clone := mz.ZipWriter.init(gpa); clone_ok := true; clone.add_from_reader(@source, 1) catch (e) { clone_ok = false; };
+    out.put_u32le(if clone_ok then 1 else 0);
+    cloned := clone.finish() catch (e) { clone.deinit(); gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; };
+    blob(@out, cloned); gpa.dealloc_bytes(cloned.ptr);
+
+    if !fs.write_file(INPLACE_PATH, archive) { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    one_ok := true; mz.zip_add_to_file_in_place(INPLACE_PATH, "one", "111", mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }, gpa) catch (e) { one_ok = false; };
+    out.put_u32le(if one_ok then 1 else 0);
+    two_ok := true; mz.zip_add_to_file_in_place(INPLACE_PATH, "two", "2222", mz.ZipEntryOptions.{ method = .store, level = 0, comment = "two-note", ascii_filename = true }, gpa) catch (e) { two_ok = false; };
+    out.put_u32le(if two_ok then 1 else 0); out.put_u32le(0);
+    if !file_blob(@out, INPLACE_PATH) { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    one := mz.zip_extract_file_to_heap(INPLACE_PATH, "one", "", .{}, 256, gpa) catch (e) "";
+    out.put_u32le(if one.ptr != null then 1 else 0); blob(@out, one); if one.ptr != null { gpa.dealloc_bytes(one.ptr); }
+    two := mz.zip_extract_file_to_heap(INPLACE_PATH, "two", "two-note", .{}, 256, gpa) catch (e) "";
+    out.put_u32le(if two.ptr != null then 1 else 0); out.put_u32le(0); blob(@out, two); if two.ptr != null { gpa.dealloc_bytes(two.ptr); }
+
+    validation_error = .undefined_error;
+    out.put_u32le(if mz.validate_zip_with_error(.{ ptr = null, len = 0 }, @validation_error, false, false, false, gpa) then 1 else 0);
+    out.put_u32le(mz.zip_error_code(validation_error));
+    validation_error = .undefined_error;
+    out.put_u32le(if mz.validate_zip_with_error(string.{ ptr = archive.ptr, len = 10 }, @validation_error, false, false, false, gpa) then 1 else 0);
+    out.put_u32le(mz.zip_error_code(validation_error));
+    validation_error = .undefined_error;
+    out.put_u32le(if mz.validate_zip_file_with_error("/tmp/miniz-zip-alias-missing.zip", @validation_error, 0, 0, false, false, false, gpa) then 1 else 0);
+    out.put_u32le(mz.zip_error_code(validation_error));
+
+    extract_error : mz.ZipError = .undefined_error;
+    failed_heap := mz.zip_extract_file_to_heap_exact("/tmp/miniz-zip-alias-missing.zip", "x", "", @extract_error, false, .{}, 256, gpa);
+    out.put_u32le(if failed_heap.ptr != null then 1 else 0); out.put_u32le(mz.zip_error_code(extract_error)); out.put_u32le(failed_heap.len);
+    extract_error = .undefined_error;
+    failed_heap = mz.zip_extract_file_to_heap_exact(INPLACE_PATH, "missing", "", @extract_error, false, .{}, 256, gpa);
+    out.put_u32le(if failed_heap.ptr != null then 1 else 0); out.put_u32le(mz.zip_error_code(extract_error)); out.put_u32le(failed_heap.len);
+    extract_error = .undefined_error;
+    failed_heap = mz.zip_extract_file_to_heap_exact(INPLACE_PATH, "two", "wrong", @extract_error, true, .{}, 256, gpa);
+    out.put_u32le(if failed_heap.ptr != null then 1 else 0); out.put_u32le(mz.zip_error_code(extract_error)); out.put_u32le(failed_heap.len);
+
+    duplicate_ok := true; mz.zip_add_to_file_in_place(INPLACE_PATH, "one", "later", mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }, gpa) catch (e) { duplicate_ok = false; };
+    if !duplicate_ok { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    first_duplicate := mz.zip_extract_file_to_heap(INPLACE_PATH, "one", "", .{}, 256, gpa) catch (e) "";
+    out.put_u32le(if first_duplicate.ptr != null then 1 else 0); blob(@out, first_duplicate);
+    if first_duplicate.ptr != null { gpa.dealloc_bytes(first_duplicate.ptr); }
+
+    inplace_error : mz.ZipError = .undefined_error;
+    failed_add := mz.zip_add_to_file_in_place_with_error(
+        "/tmp/miniz-missing-dir/out.zip", "x", "x", @inplace_error,
+        mz.ZipEntryOptions.{ method = .store, level = 0 }, gpa,
+    );
+    out.put_u32le(if failed_add then 1 else 0); out.put_u32le(mz.zip_error_code(inplace_error));
+    out.put_u32le(if fs.exists("/tmp/miniz-missing-dir/out.zip") then 1 else 0);
+    failed_new : [:0]u8 : "/tmp/miniz-zip-alias-failed-new.zip"; fs.delete_file(failed_new);
+    inplace_error = .undefined_error;
+    failed_add = mz.zip_add_to_file_in_place_with_error(
+        failed_new, "/bad", "x", @inplace_error,
+        mz.ZipEntryOptions.{ method = .store, level = 0 }, gpa,
+    );
+    out.put_u32le(if failed_add then 1 else 0); out.put_u32le(mz.zip_error_code(inplace_error));
+    out.put_u32le(if fs.exists(failed_new) then 1 else 0);
+    inplace_error = .undefined_error;
+    failed_add = mz.zip_add_to_file_in_place_with_error(
+        INPLACE_PATH, "/bad", "x", @inplace_error,
+        mz.ZipEntryOptions.{ method = .store, level = 0 }, gpa,
+    );
+    out.put_u32le(if failed_add then 1 else 0); out.put_u32le(mz.zip_error_code(inplace_error));
+
+    gpa.dealloc_bytes(archive.ptr);
+    bytes_out := out.take(); wrote := fs.write_file("/tmp/sx-zip-alias-surface.bin", bytes_out); gpa.dealloc_bytes(bytes_out.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

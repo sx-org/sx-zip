@@ -1,0 +1,90 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+check_seek :: (reader: *mz.ZipReader, index: i64, options: mz.ZipExtractOptions, expected: string, alloc: Allocator) -> bool {
+    seek := mz.zip_streaming_extract(reader, index, options, expected.len + 16, alloc) catch (e) { return false; };
+    if seek.size != expected.len or seek.offset() != 0 { seek.deinit(); return false; }
+    scratch : [37]u8 = ---;
+    zero := seek.read(string.{ ptr = @scratch[0], len = 0 }) catch (e) { seek.deinit(); return false; };
+    if zero != 0 or seek.offset() != 0 { seek.deinit(); return false; }
+
+    first := if expected.len > 5 then 5 else expected.len;
+    seek.seek(first) catch (e) { seek.deinit(); return false; };
+    if seek.offset() != first { seek.deinit(); return false; }
+    want := expected.len - first;
+    if want > 17 { want = 17; }
+    made := seek.read(string.{ ptr = @scratch[0], len = want }) catch (e) { seek.deinit(); return false; };
+    if made != want or (made > 0 and !mz.bytes_equal(string.{ ptr = @scratch[0], len = made }, string.{ ptr = @expected.ptr[first], len = made })) {
+        seek.deinit(); return false;
+    }
+
+    back := if expected.len > 2 then 2 else 0;
+    seek.seek(back) catch (e) { seek.deinit(); return false; };
+    want = expected.len - back;
+    if want > 11 { want = 11; }
+    made = seek.read(string.{ ptr = @scratch[0], len = want }) catch (e) { seek.deinit(); return false; };
+    if made != want or (made > 0 and !mz.bytes_equal(string.{ ptr = @scratch[0], len = made }, string.{ ptr = @expected.ptr[back], len = made })) {
+        seek.deinit(); return false;
+    }
+
+    bad_low := false; seek.seek(-1) catch (e) { bad_low = e == error.InvalidData; };
+    bad_high := false; seek.seek(expected.len + 1) catch (e) { bad_high = e == error.InvalidData; };
+    if !bad_low or !bad_high or reader.take_last_error() != .invalid_parameter { seek.deinit(); return false; }
+
+    seek.seek(0) catch (e) { seek.deinit(); return false; };
+    out := mz.ByteWriter.init(alloc);
+    while true {
+        made = seek.read(string.{ ptr = @scratch[0], len = scratch.len }) catch (e) { seek.deinit(); out.deinit(); return false; };
+        if made == 0 { break; }
+        out.put_bytes(string.{ ptr = @scratch[0], len = made });
+    }
+    actual := out.take();
+    same := mz.bytes_equal(actual, expected) and seek.offset() == expected.len;
+    if actual.ptr != null { alloc.dealloc_bytes(actual.ptr); }
+    if !same or !seek.end() { return false; }
+    if seek.end() or reader.take_last_error() != .invalid_parameter { return false; }
+    read_failed := false;
+    ignored := seek.read(string.{ ptr = @scratch[0], len = 1 }) catch (e) { read_failed = e == error.Finished; 0 };
+    read_failed and reader.take_last_error() == .invalid_parameter
+}
+
+invalid_begin :: (reader: *mz.ZipReader, alloc: Allocator) -> bool {
+    iterator := mz.zip_streaming_extract(reader, 99, .{}, 100, alloc) catch (e) { return true; };
+    iterator.deinit();
+    false
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    stored := "stored-streaming-seek-payload";
+    repeated_raw := gpa.alloc_bytes(70000);
+    if repeated_raw == null { return 1; }
+    repeated := string.{ ptr = xx repeated_raw, len = 70000 };
+    i := 0;
+    while i < repeated.len { repeated.ptr[i] = (i * 31 + (i / 97) * 7).(u8); i += 1; }
+
+    writer := mz.ZipWriter.init(gpa);
+    writer.add_options("stored", stored, mz.ZipEntryOptions.{ method = .store, level = 0 }) catch (e) { writer.deinit(); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    writer.add_options("deflated", repeated, mz.ZipEntryOptions.{ method = .deflate, level = 6 }) catch (e) { writer.deinit(); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    writer.add_options("empty", "", mz.ZipEntryOptions.{ method = .store, level = 0 }) catch (e) { writer.deinit(); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    reader := mz.open_zip(archive) catch (e) { gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(repeated.ptr); return 1; };
+
+    ok := check_seek(@reader, 0, .{}, stored, gpa) and
+          check_seek(@reader, 1, .{}, repeated, gpa) and
+          check_seek(@reader, 2, .{}, "", gpa);
+    raw0 := reader.compressed_view(0) catch (e) { gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    raw1 := reader.compressed_view(1) catch (e) { gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(repeated.ptr); return 1; };
+    ok = ok and check_seek(@reader, 0, mz.ZipExtractOptions.{ compressed_data = true }, raw0, gpa) and
+         check_seek(@reader, 1, mz.ZipExtractOptions.{ compressed_data = true }, raw1, gpa);
+
+    ok = ok and invalid_begin(@reader, gpa);
+
+    gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(repeated.ptr);
+    if !ok or gpa.alloc_count != 0 {
+        print("ZIP streaming seek failed ok={} allocations={}\n", ok, gpa.alloc_count);
+        return 1;
+    }
+    print("ZIP stored/deflate/raw/empty streaming seek and lifecycle matrix ok\n");
+    0
+}

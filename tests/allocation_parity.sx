@@ -1,0 +1,46 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+FailOnce :: struct { calls: i64; }
+
+impl Allocator for FailOnce {
+    alloc_bytes :: (self: *FailOnce, size: i64) -> *void {
+        self.calls += 1;
+        null
+    }
+    dealloc_bytes :: (self: *FailOnce, ptr: *void) {}
+}
+
+main :: () -> i32 {
+    failed := FailOnce.{ calls = 0 };
+    deflater : mz.MzDeflateStream = ---;
+    deflate_status := mz.MzDeflateStream.init2(@deflater, 6, 8, 15, 8, mz.CompressionStrategy.default, failed);
+    print("deflate_init={}\n", deflate_status);
+
+    failed.calls = 0;
+    inflater : mz.MzInflateStream = ---;
+    inflate_status := mz.MzInflateStream.init2(@inflater, 15, 1024, failed);
+    print("inflate_init={}\n", inflate_status);
+
+    failed.calls = 0;
+    writer := mz.ZipWriter.init(failed);
+    writer_ok := true;
+    writer.add("x", "payload", .store, 0) catch (e) { writer_ok = false; };
+    print("writer_init={},{}\n", if writer_ok then 1 else 0, mz.zip_error_code(writer.peek_last_error()));
+    writer.deinit();
+
+    gpa := mem.GPA.init();
+    normal := mz.ZipWriter.init(gpa);
+    normal.add("x", "payload", .store, 0) catch (e) { return 1; };
+    archive := normal.finish() catch (e) { normal.deinit(); return 1; };
+    reader := mz.open_zip(archive) catch (e) { gpa.dealloc_bytes(archive.ptr); return 1; };
+    failed.calls = 0;
+    extract_ok := true;
+    plain := reader.extract(0, 1024, failed) catch (e) {
+        extract_ok = false;
+        string.{ ptr = null, len = 0 }
+    };
+    print("reader_extract={},{}\n", if extract_ok then 1 else 0, mz.zip_error_code(reader.peek_last_error()));
+    gpa.dealloc_bytes(archive.ptr);
+    if gpa.alloc_count == 0 then 0 else 1
+}

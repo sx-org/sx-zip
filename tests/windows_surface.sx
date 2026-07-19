@@ -1,0 +1,33 @@
+#import "modules/std/core.sx";
+#import "modules/std/mem.sx";
+#import "modules/std/target.sx";
+mz :: #import "../miniz.sx";
+
+// Cross-target compile probe. This deliberately reaches every filesystem
+// operation used by the archive adapters so a header-only/DCE-only import
+// cannot hide a missing Windows implementation.
+main :: () -> i32 {
+    last_error : mz.ZipError = .no_error;
+
+    writer := mz.open_zip_writer_file_with_error("sx-miniz-windows.zip", @last_error, 0, false, true) catch (e) { return 1; };
+    writer.writer.add_file_default("source", "sx-miniz-windows-source.bin") catch (e) {
+        writer.end();
+        return 2;
+    };
+    writer.finish() catch (e) {
+        writer.end();
+        return 3;
+    };
+    if !writer.end() { return 4; }
+
+    reader := mz.open_zip_file_with_error("sx-miniz-windows.zip", @last_error) catch (e) { return 5; };
+    mz.zip_extract_to_file(@reader.reader, 0, "sx-miniz-windows-output.bin") catch (e) {
+        reader.end();
+        return 6;
+    };
+    if !reader.end() { return 7; }
+
+    if !mz.validate_zip_file_with_error("sx-miniz-windows.zip", @last_error) { return 8; }
+    if !mz.zip_add_to_file_in_place_with_error("sx-miniz-windows-update.zip", "entry", "payload", @last_error) { return 9; }
+    0
+}

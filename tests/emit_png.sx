@@ -1,0 +1,40 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    // Bottom-up physical storage: red bottom row, blue top row.
+    pixels : [6]u8 = .[255, 0, 0, 0, 0, 255];
+    png := mz.write_png(string.{ ptr = @pixels[0], len = 6 }, 1, 2, 3, -3, 9, context.allocator) catch (e) { return 1; };
+    ok := fs.write_file("/tmp/sx-miniz-interop.png", png);
+    context.allocator.dealloc_bytes(png.ptr);
+    if !ok { return 1; }
+
+    // Positive stride with padding. Each channel count gets an independent
+    // decoder fixture; only the first 2*channels bytes of each six-byte row
+    // are pixels.
+    samples : [52]u8 = .[
+        1, 2, 0, 0, 0, 0, 3, 4, 0, 0, 0, 0,
+        1, 11, 2, 12, 0, 0, 3, 13, 4, 14, 0, 0,
+        1, 11, 21, 2, 12, 22, 3, 13, 23, 4, 14, 24,
+        1, 11, 21, 31, 2, 12, 22, 32, 3, 13, 23, 33, 4, 14, 24, 34,
+    ];
+    offsets : [4]i64 : .[0, 12, 24, 36];
+    lengths : [4]i64 : .[12, 12, 12, 16];
+    strides : [4]i64 : .[6, 6, 6, 8];
+    paths : [4]string : .[
+        "/tmp/sx-miniz-interop-1.png",
+        "/tmp/sx-miniz-interop-2.png",
+        "/tmp/sx-miniz-interop-3.png",
+        "/tmp/sx-miniz-interop-4.png",
+    ];
+    c := 1;
+    while c <= 4 {
+        view := string.{ ptr = @samples[offsets[c - 1]], len = lengths[c - 1] };
+        encoded := mz.write_png(view, 2, 2, c, strides[c - 1], 6, context.allocator) catch (e) { return 1; };
+        wrote := fs.write_file(paths[c - 1], encoded);
+        context.allocator.dealloc_bytes(encoded.ptr);
+        if !wrote { return 1; }
+        c += 1;
+    }
+    0
+}

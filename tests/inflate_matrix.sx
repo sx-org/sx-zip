@@ -1,0 +1,102 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+record_call :: (stream: *mz.MzInflateStream, input: string, output: string, flush: mz.MzFlush, transcript: *mz.ByteWriter) -> i64 {
+    progress := stream.step(input, output, flush);
+    transcript.put_u32le(progress.status);
+    transcript.put_u32le(progress.consumed);
+    transcript.put_u32le(progress.produced);
+    transcript.put_u32le(stream.total_in);
+    transcript.put_u32le(stream.total_out);
+    transcript.put_u32le(stream.adler);
+    transcript.put_u32le(mz.crc32(string.{ ptr = output.ptr, len = progress.produced }));
+    progress.status
+}
+
+one_call_case :: (input: string, window_bits: i64, flush: mz.MzFlush, output_size: i64, output: string, transcript: *mz.ByteWriter, alloc: Allocator) -> bool {
+    stream : mz.MzInflateStream = ---;
+    transcript.put_u32le(stream.init2(window_bits, 1073741824, alloc));
+    ignored := record_call(@stream, input, string.{ ptr = output.ptr, len = output_size }, flush, transcript);
+    transcript.put_u32le(stream.end());
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    plain_raw := gpa.alloc_bytes(70000);
+    if plain_raw == null { return 1; }
+    plain := string.{ ptr = xx plain_raw, len = 70000 };
+    i := 0;
+    while i < plain.len { plain.ptr[i] = ('a' + ((i / 31) % 7)).(u8); i += 1; }
+
+    packed_raw := gpa.alloc_bytes(80000);
+    if packed_raw == null { gpa.dealloc_bytes(plain.ptr); return 1; }
+    packed_buffer := string.{ ptr = xx packed_raw, len = 80000 };
+    packed_size := mz.compress_into(plain, packed_buffer, 6, gpa) catch (e) {
+        gpa.dealloc_bytes(packed_buffer.ptr); gpa.dealloc_bytes(plain.ptr); return 1;
+    };
+    packed := string.{ ptr = packed_buffer.ptr, len = packed_size };
+    raw_result := mz.deflate_flags(plain, 128, false, .fastest, gpa);
+    if raw_result.bytes.ptr == null { gpa.dealloc_bytes(packed_buffer.ptr); gpa.dealloc_bytes(plain.ptr); return 1; }
+    output_raw := gpa.alloc_bytes(80000);
+    if output_raw == null {
+        gpa.dealloc_bytes(raw_result.bytes.ptr); gpa.dealloc_bytes(packed_buffer.ptr); gpa.dealloc_bytes(plain.ptr); return 1;
+    }
+    output := string.{ ptr = xx output_raw, len = 80000 };
+    transcript := mz.ByteWriter.init(gpa);
+
+    one_call_case(string.{ ptr = packed.ptr, len = 3 }, 15, .none, 7, output, @transcript, gpa);
+    one_call_case(string.{ ptr = packed.ptr, len = 3 }, 15, .partial, 7, output, @transcript, gpa);
+    one_call_case(string.{ ptr = packed.ptr, len = 3 }, 15, .sync, 7, output, @transcript, gpa);
+
+    stream : mz.MzInflateStream = ---;
+    transcript.put_u32le(stream.init2(15, 1073741824, gpa));
+    ignored_status := record_call(@stream, packed, output, .full, @transcript);
+    ignored_status = record_call(@stream, packed, output, .finish, @transcript);
+    transcript.put_u32le(stream.end());
+
+    transcript.put_u32le(stream.init2(15, 1073741824, gpa));
+    ignored_status = record_call(@stream, packed, string.{ ptr = output.ptr, len = 0 }, .none, @transcript);
+    calls := 0;
+    while ignored_status != mz.MZ_STREAM_END and calls < 16 {
+        remaining := string.{ ptr = @packed.ptr[stream.total_in], len = packed.len - stream.total_in };
+        ignored_status = record_call(@stream, remaining, string.{ ptr = output.ptr, len = 17000 }, .none, @transcript);
+        calls += 1;
+    }
+    if ignored_status != mz.MZ_STREAM_END { return 1; }
+    transcript.put_u32le(stream.end());
+
+    one_call_case(raw_result.bytes, -15, .finish, output.len, output, @transcript, gpa);
+    bad_header : [2]u8 = .[0, 0];
+    one_call_case(string.{ ptr = @bad_header[0], len = bad_header.len }, 15, .finish, output.len, output, @transcript, gpa);
+    fdict : [2]u8 = .[0x78, 0x20];
+    one_call_case(string.{ ptr = @fdict[0], len = fdict.len }, 15, .finish, output.len, output, @transcript, gpa);
+    reserved : [7]u8 = .[0x78, 0x01, 0x07, 0, 0, 0, 1];
+    one_call_case(string.{ ptr = @reserved[0], len = reserved.len }, 15, .finish, output.len, output, @transcript, gpa);
+
+    bad_raw := gpa.alloc_bytes(packed.len);
+    if bad_raw == null { return 1; }
+    bad_ptr : [*]u8 = xx bad_raw;
+    i = 0;
+    while i < packed.len { bad_ptr[i] = packed[i]; i += 1; }
+    bad_ptr[packed.len - 1] = bad_ptr[packed.len - 1] ^ 1;
+    one_call_case(string.{ ptr = bad_ptr, len = packed.len }, 15, .finish, output.len, output, @transcript, gpa);
+    gpa.dealloc_bytes(bad_ptr);
+
+    transcript.put_u32le(stream.init2(15, 1073741824, gpa));
+    ignored_status = record_call(@stream, string.{ ptr = packed.ptr, len = packed.len - 1 }, output, .finish, @transcript);
+    ignored_status = record_call(@stream, "", output, .finish, @transcript);
+    ignored_status = record_call(@stream, "", output, .sync, @transcript);
+    ignored_status = record_call(@stream, "", output, .full, @transcript);
+    transcript.put_u32le(stream.end());
+
+    bytes := transcript.take();
+    wrote := fs.write_file("/tmp/sx-miniz-inflate-matrix.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    gpa.dealloc_bytes(output.ptr);
+    gpa.dealloc_bytes(raw_result.bytes.ptr);
+    gpa.dealloc_bytes(packed_buffer.ptr);
+    gpa.dealloc_bytes(plain.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

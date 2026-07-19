@@ -1,0 +1,133 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+FLAGS : [10]i64 : .[
+    16391,
+    128,
+    16384,
+    65664,
+    131200,
+    262272,
+    540672,
+    4224,
+    8320,
+    196736,
+];
+
+SinkState :: struct { out: mz.ByteWriter; fail: bool; }
+
+PatternAllocator :: struct { parent: Allocator; }
+
+impl Allocator for PatternAllocator {
+    alloc_bytes :: (self: *PatternAllocator, size: i64) -> *void {
+        raw := self.parent.alloc_bytes(size);
+        if raw != null { c.memset(raw, 0xa5, size); }
+        raw
+    }
+    dealloc_bytes :: (self: *PatternAllocator, ptr: *void) {
+        if ptr != null { self.parent.dealloc_bytes(ptr); }
+    }
+}
+
+sink_write :: (ctx: *void, bytes: string) -> bool {
+    state : *SinkState = xx ctx;
+    if state.fail { return false; }
+    state.out.put_bytes(bytes);
+    true
+}
+
+test_lifecycle :: (data: string, alloc: Allocator) -> bool {
+    flags := 4224;
+    expected := mz.deflate_flags(data, flags, false, .fastest, alloc);
+    state := mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, alloc);
+    output := mz.ByteWriter.init(alloc);
+    input_at := 0;
+    byte : [1]u8 = ---;
+    while true {
+        input : string = .{ ptr = null, len = 0 };
+        if input_at < data.len { input = string.{ ptr = @data.ptr[input_at], len = data.len - input_at }; }
+        progress := state.step(input, string.{ ptr = @byte[0], len = 1 }, .finish) catch (e) {
+            state.deinit(); output.deinit(); alloc.dealloc_bytes(expected.bytes.ptr); return false;
+        };
+        input_at += progress.consumed;
+        if progress.produced == 1 { output.put(byte[0]); }
+        if progress.status == .done { break; }
+        if state.status() != .okay { state.deinit(); output.deinit(); alloc.dealloc_bytes(expected.bytes.ptr); return false; }
+    }
+    actual := output.take();
+    ok := state.status() == .done and state.adler() == mz.adler32(data) and
+          mz.bytes_equal(actual, expected.bytes);
+    rejected := false;
+    ignored := state.step("x", string.{ ptr = @byte[0], len = 1 }, .finish) catch (e) {
+        if e == error.Finished and state.status() == .bad_param { rejected = true; }
+        mz.StreamProgress.{ consumed = 0, produced = 0, status = .done }
+    };
+    state.deinit();
+    alloc.dealloc_bytes(actual.ptr);
+    alloc.dealloc_bytes(expected.bytes.ptr);
+    if !ok or !rejected { return false; }
+
+    sink_state := SinkState.{ out = mz.ByteWriter.init(alloc), fail = false };
+    sink := mz.TdeflSink.{ ctx = xx @sink_state, write = sink_write };
+    count := mz.deflate_flags_to_output(data, flags, sink, false, .fastest, alloc) catch (e) { sink_state.out.deinit(); return false; };
+    callback_bytes := sink_state.out.take();
+    callback_expected := mz.deflate_flags(data, flags, false, .fastest, alloc);
+    callback_ok := count == callback_bytes.len and mz.bytes_equal(callback_bytes, callback_expected.bytes);
+    alloc.dealloc_bytes(callback_bytes.ptr);
+    alloc.dealloc_bytes(callback_expected.bytes.ptr);
+    if !callback_ok { return false; }
+
+    failing_state := SinkState.{ out = mz.ByteWriter.init(alloc), fail = true };
+    failing_sink := mz.TdeflSink.{ ctx = xx @failing_state, write = sink_write };
+    failed := false;
+    ignored_count := mz.deflate_flags_to_output(data, flags, failing_sink, false, .fastest, alloc) catch (e) {
+        if e == error.Io { failed = true; }
+        0
+    };
+    failing_state.out.deinit();
+    failed
+}
+
+emit :: (data: string, less_memory: bool, path: string, alloc: Allocator) -> bool {
+    output := mz.ByteWriter.init(alloc);
+    case_index := 0;
+    while case_index < FLAGS.len {
+        result := mz.deflate_flags(data, FLAGS[case_index], less_memory, .fastest, alloc);
+        output.put_u32le(result.bytes.len);
+        output.put_bytes(result.bytes);
+        alloc.dealloc_bytes(result.bytes.ptr);
+        case_index += 1;
+    }
+    pattern := PatternAllocator.{ parent = alloc };
+    nondeterministic := mz.deflate_flags(
+        data, 128 | mz.TDEFL_NONDETERMINISTIC_PARSING, less_memory, .fastest, pattern,
+    );
+    output.put_u32le(nondeterministic.bytes.len);
+    output.put_bytes(nondeterministic.bytes);
+    if nondeterministic.bytes.ptr != null { pattern.dealloc_bytes(nondeterministic.bytes.ptr); }
+    bytes := output.take();
+    ok := fs.write_file(path, bytes);
+    alloc.dealloc_bytes(bytes.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    raw := gpa.alloc_bytes(100000);
+    data := string.{ ptr = xx raw, len = 100000 };
+    state := 0x31415926;
+    i := 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        data.ptr[i] = if i % 97 < 72 then ('A' + (i % 7)).(u8) else (state & 0xff).(u8);
+        i += 1;
+    }
+    normal := emit(data, false, "/tmp/sx-miniz-tdefl-flags.bin", gpa);
+    less := emit(data, true, "/tmp/sx-miniz-tdefl-flags-less.bin", gpa);
+    lifecycle := test_lifecycle(data, gpa);
+    gpa.dealloc_bytes(raw);
+    if !normal or !less or !lifecycle or gpa.alloc_count != 0 { return 1; }
+    0
+}

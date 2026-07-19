@@ -1,0 +1,138 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+DIST_EXTRAS : [30]i64 : .[0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+LENGTH_BASES : [29]i64 : .[3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+LENGTH_EXTRAS : [29]i64 : .[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+
+expect_error :: (data: string, want: mz.Error, alloc: Allocator) -> bool {
+    result := mz.inflate(data, 1000000, alloc) catch (e) { return e == want; };
+    alloc.dealloc_bytes(result.ptr);
+    false
+}
+
+invalid_huffman :: () -> bool {
+    oversubscribed : [3]u8 = .[1, 1, 1];
+    tree := mz.build_huffman(string.{ ptr = @oversubscribed[0], len = 3 }) catch (e) {
+        if e != error.InvalidData { return false; }
+        incomplete : [2]u8 = .[2, 2];
+        second := mz.build_huffman(string.{ ptr = @incomplete[0], len = 2 }) catch (e2) {
+            return e2 == error.InvalidData;
+        };
+        return false;
+    };
+    false
+}
+
+limited_huffman :: () -> bool {
+    freq : [286]i64 = ---;
+    i := 0;
+    while i < 286 { freq[i] = 0; i += 1; }
+    a := 1;
+    b := 1;
+    i = 0;
+    while i < 24 {
+        freq[i] = a;
+        next := a + b;
+        a = b;
+        b = next;
+        i += 1;
+    }
+    lengths := mz.make_lengths(freq, 15, 2);
+    kraft := 0;
+    i = 0;
+    while i < 24 {
+        if lengths[i] == 0 or lengths[i] > 15 { print("bad limited len {}={}\n", i, lengths[i]); return false; }
+        kraft += 1 << (15 - lengths[i]);
+        i += 1;
+    }
+    if kraft != 32768 { return false; }
+    tree := mz.build_huffman(string.{ ptr = @lengths[0], len = 286 }) catch (e) { print("limited tree {}\n", e); return false; };
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    bits := mz.BitWriter.init(gpa);
+    bits.write(1, 1);
+    bits.write(1, 2);
+
+    // Seed a complete 32 KiB history of one value.
+    i := 0;
+    while i < 32768 { mz.emit_fixed_symbol(@bits, 'A'); i += 1; }
+    expected := 32768;
+
+    // Exercise every legal distance symbol at its base distance.
+    di := 0;
+    while di < 30 {
+        mz.emit_fixed_symbol(@bits, 257); // length 3
+        bits.write(mz.reverse_bits(di, 5), 5);
+        if DIST_EXTRAS[di] > 0 { bits.write(0, DIST_EXTRAS[di]); }
+        expected += 3;
+        di += 1;
+    }
+
+    // Exercise every legal length symbol at its base length.
+    li := 0;
+    while li < 29 {
+        mz.emit_fixed_symbol(@bits, 257 + li);
+        if LENGTH_EXTRAS[li] > 0 { bits.write(0, LENGTH_EXTRAS[li]); }
+        bits.write(mz.reverse_bits(0, 5), 5); // distance 1
+        expected += LENGTH_BASES[li];
+        li += 1;
+    }
+    mz.emit_fixed_symbol(@bits, 256);
+    packed := bits.finish();
+    plain := mz.inflate(packed, expected, gpa) catch (e) {
+        print("code inflate error {}\n", e);
+        gpa.dealloc_bytes(packed.ptr);
+        return 1;
+    };
+    if plain.len != expected { print("len {} expected {}\n", plain.len, expected); return 1; }
+    i = 0;
+    while i < plain.len { if plain[i] != 'A' { print("bad byte {} at {}\n", plain[i], i); return 1; } i += 1; }
+    gpa.dealloc_bytes(plain.ptr);
+    gpa.dealloc_bytes(packed.ptr);
+
+    // Fixed trees define 286/287 and distance 30/31 bit patterns, but RFC 1951
+    // reserves them. They must fail rather than indexing a base table.
+    reserved_lit := mz.BitWriter.init(gpa);
+    reserved_lit.write(1, 1);
+    reserved_lit.write(1, 2);
+    mz.emit_fixed_symbol(@reserved_lit, 286);
+    lit_stream := reserved_lit.finish();
+    lit_bad := expect_error(lit_stream, error.InvalidData, gpa);
+    gpa.dealloc_bytes(lit_stream.ptr);
+    if !lit_bad { return 1; }
+
+    reserved_dist := mz.BitWriter.init(gpa);
+    reserved_dist.write(1, 1);
+    reserved_dist.write(1, 2);
+    mz.emit_fixed_symbol(@reserved_dist, 'A');
+    mz.emit_fixed_symbol(@reserved_dist, 257);
+    reserved_dist.write(mz.reverse_bits(30, 5), 5);
+    dist_stream := reserved_dist.finish();
+    dist_bad := expect_error(dist_stream, error.InvalidData, gpa);
+    gpa.dealloc_bytes(dist_stream.ptr);
+    if !dist_bad { return 1; }
+
+    // Dynamic header with four one-bit code-length symbols is oversubscribed.
+    dynamic := mz.BitWriter.init(gpa);
+    dynamic.write(1, 1);
+    dynamic.write(2, 2);
+    dynamic.write(0, 5); // HLIT=257
+    dynamic.write(0, 5); // HDIST=1
+    dynamic.write(0, 4); // HCLEN=4
+    dynamic.write(1, 3);
+    dynamic.write(1, 3);
+    dynamic.write(1, 3);
+    dynamic.write(1, 3);
+    dyn_stream := dynamic.finish();
+    dyn_bad := expect_error(dyn_stream, error.InvalidData, gpa);
+    gpa.dealloc_bytes(dyn_stream.ptr);
+    if !dyn_bad or !invalid_huffman() or !limited_huffman() { return 1; }
+
+    if gpa.alloc_count != 0 { print("codes leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("code boundary smoke ok\n");
+    0
+}

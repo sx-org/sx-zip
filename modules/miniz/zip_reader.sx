@@ -1,0 +1,31 @@
+// Reader-only, memory/callback ZIP facade. Filesystem adapters and every
+// archive-writing declaration remain outside this import boundary.
+#import "../../miniz.sx";
+
+Reader :: ZipReader;
+Entry :: ZipEntry;
+Method :: ZipMethod;
+ArchiveError :: ZipError;
+ErrorState :: ZipErrorState;
+LocateOptions :: ZipLocateOptions;
+ExtractOptions :: ZipExtractOptions;
+Mode :: ZipMode;
+StorageType :: ZipStorageType;
+ReadSource :: ZipReadSource;
+ExtractSink :: ZipExtractSink;
+Iterator :: ZipExtractIterator;
+SeekExtractor :: ZipSeekExtractor;
+
+error_code :: zip_error_code;
+error_string :: zip_error_string;
+error_string_value :: zip_error_string_value;
+open_memory :: open_zip;
+open_memory_with_error :: open_zip_with_error;
+open_embedded :: open_zip_embedded;
+open_range :: open_zip_range;
+validate_memory :: validate_zip;
+extract_to_output :: zip_extract_to_output;
+extract_name_to_output :: zip_extract_name_to_output;
+extract_iter :: zip_extract_iter;
+extract_name_iter :: zip_extract_name_iter;
+streaming_extract :: zip_streaming_extract;

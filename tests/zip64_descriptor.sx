@@ -1,0 +1,36 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+check :: (out: *mz.ByteWriter, path: [:0]u8) -> bool {
+    maybe_data := fs.read_file(path);
+    if maybe_data == null { return false; }
+    data := maybe_data!;
+    reader := mz.open_zip(data) catch (e) { context.allocator.dealloc_bytes(data.ptr); return false; };
+    out.put_u32le(1); out.put_u32le(mz.zip_error_code(reader.take_last_error()));
+    out.put_u32le(if reader.is_zip64() then 1 else 0);
+    stat_ok := true; empty_entry : mz.ZipEntry = ---;
+    entry := reader.entry(0) catch (e) { stat_ok = false; empty_entry };
+    out.put_u32le(if stat_ok then 1 else 0);
+    fixed : [256]u8 = ---;
+    extract_ok := true;
+    made := reader.extract_into(0, string.{ ptr = @fixed[0], len = 49 }, mz.ZipExtractOptions.{}) catch (e) { extract_ok = false; 0 };
+    out.put_u32le(if extract_ok then 1 else 0);
+    expected := "zip64 descriptor payload zip64 descriptor payload";
+    out.put_u32le(if extract_ok and made == expected.len and mz.bytes_equal(string.{ ptr = @fixed[0], len = made }, expected) then 1 else 0);
+    raw_ok := true;
+    raw_made := reader.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{ compressed_data = true }) catch (e) { raw_ok = false; 0 };
+    out.put_u32le(if raw_ok then 1 else 0);
+    validate_ok := true; reader.validate_entry(0) catch (e) { validate_ok = false; };
+    out.put_u32le(if validate_ok then 1 else 0);
+    reader.end(); context.allocator.dealloc_bytes(data.ptr);
+    stat_ok and extract_ok and raw_ok and validate_ok
+}
+
+main :: () -> i32 {
+    out := mz.ByteWriter.init(context.allocator);
+    if !check(@out, "/tmp/miniz-zip64-descriptor-signed.zip") or
+       !check(@out, "/tmp/miniz-zip64-descriptor-unsigned.zip") { out.deinit(); return 1; }
+    bytes := out.take(); ok := fs.write_file("/tmp/sx-zip64-descriptor.bin", bytes);
+    context.allocator.dealloc_bytes(bytes.ptr);
+    if ok then 0 else 1
+}

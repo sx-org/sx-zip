@@ -1,0 +1,72 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+STATUSES : [11]i64 : .[0, 1, 2, -1, -2, -3, -4, -5, -6, -10000, 12345];
+LENGTHS : [11]i64 : .[0, 1, 3, 4, 7, 8, 5551, 5552, 5553, 11999, 12000];
+BOUNDS : [7]i64 : .[0, 1, 31743, 31744, 31745, 65535, 1000000];
+
+put_string :: (out: *mz.ByteWriter, value: string, known: bool = true) {
+    if !known { out.put_u32le(0xffffffff); return; }
+    out.put_u32le(value.len);
+    out.put_bytes(value);
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    out := mz.ByteWriter.init(gpa);
+    put_string(@out, mz.version());
+    i := 0;
+    while i < STATUSES.len {
+        value, known := mz.error_string(STATUSES[i]);
+        put_string(@out, value, known);
+        i += 1;
+    }
+
+    data : [12000]u8 = ---;
+    state := 0x6d2b79f5;
+    i = 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        data[i] = ((state + i * 37) & 0xff).(u8);
+        i += 1;
+    }
+    null_data := string.{ ptr = null, len = 0 };
+    out.put_u32le(mz.adler32(null_data, 0x12345678));
+    out.put_u32le(mz.crc32(null_data, 0x89abcdef));
+    i = 0;
+    while i < LENGTHS.len {
+        view := string.{ ptr = @data[0], len = LENGTHS[i] };
+        out.put_u32le(mz.adler32(view));
+        out.put_u32le(mz.crc32(view));
+        i += 1;
+    }
+
+    adler := 1;
+    crc := 0;
+    i = 0;
+    while i < data.len {
+        amount := ((i * 17) % 101) + 1;
+        if amount > data.len - i { amount = data.len - i; }
+        view := string.{ ptr = @data[i], len = amount };
+        adler = mz.adler32(view, adler);
+        crc = mz.crc32(view, crc);
+        i += amount;
+    }
+    out.put_u32le(adler);
+    out.put_u32le(crc);
+
+    i = 0;
+    while i < BOUNDS.len {
+        bound := mz.compress_bound(BOUNDS[i]) catch (e) { out.deinit(); return 1; };
+        out.put_u32le(bound);
+        out.put_u32le(bound);
+        i += 1;
+    }
+    bytes := out.take();
+    wrote := fs.write_file("/tmp/sx-miniz-core-surface.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

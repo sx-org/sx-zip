@@ -1,0 +1,39 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    maybe_packed := fs.read_file("/tmp/miniz-miniz-interop.zlib");
+    if maybe_packed == null { return 1; }
+    packed := maybe_packed!;
+    plain := mz.decompress(packed, 1000, context.allocator) catch (e) { context.allocator.dealloc_bytes(packed.ptr); return 1; };
+    zlib_ok := mz.bytes_equal(plain, "from upstream miniz zlib");
+    context.allocator.dealloc_bytes(plain.ptr);
+    context.allocator.dealloc_bytes(packed.ptr);
+    if !zlib_ok { return 1; }
+
+    maybe_archive := fs.read_file("/tmp/miniz-miniz-interop.zip");
+    if maybe_archive == null { return 1; }
+    archive := maybe_archive!;
+    reader := mz.open_zip(archive) catch (e) { context.allocator.dealloc_bytes(archive.ptr); return 1; };
+    stored := reader.extract_name("stored.txt", 1000, context.allocator) catch (e) { context.allocator.dealloc_bytes(archive.ptr); return 1; };
+    repeated := reader.extract_name("nested/repeated.txt", 1000, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(stored.ptr);
+        context.allocator.dealloc_bytes(archive.ptr);
+        return 1;
+    };
+    ok := mz.bytes_equal(stored, "from upstream miniz") and mz.bytes_equal(repeated, "miniz miniz miniz miniz miniz miniz");
+    context.allocator.dealloc_bytes(stored.ptr);
+    context.allocator.dealloc_bytes(repeated.ptr);
+    context.allocator.dealloc_bytes(archive.ptr);
+    if !ok { return 1; }
+
+    maybe_zip64 := fs.read_file("/tmp/miniz-miniz-interop-zip64.zip");
+    if maybe_zip64 == null { return 1; }
+    zip64_archive := maybe_zip64!;
+    zip64_reader := mz.open_zip(zip64_archive) catch (e) { context.allocator.dealloc_bytes(zip64_archive.ptr); return 1; };
+    zip64_plain := zip64_reader.extract_name("zip64.txt", 1000, context.allocator) catch (e) { context.allocator.dealloc_bytes(zip64_archive.ptr); return 1; };
+    zip64_ok := zip64_reader.zip64 and mz.bytes_equal(zip64_plain, "from upstream miniz zip64");
+    context.allocator.dealloc_bytes(zip64_plain.ptr);
+    context.allocator.dealloc_bytes(zip64_archive.ptr);
+    if zip64_ok then 0 else 1
+}

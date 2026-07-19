@@ -1,0 +1,115 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SinkState :: struct {
+    out: mz.ByteWriter;
+    calls: i64;
+    fail_after: i64;
+}
+
+sink_write :: (ctx: *void, bytes: string) -> bool {
+    state : *SinkState = xx ctx;
+    state.calls += 1;
+    if state.fail_after >= 0 and state.calls - 1 >= state.fail_after { return false; }
+    state.out.put_bytes(bytes);
+    true
+}
+
+status_code :: (status: mz.TdeflStatus) -> i64 {
+    if status == .bad_param { return -2; }
+    if status == .put_buf_failed { return -1; }
+    if status == .okay { return 0; }
+    1
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    raw := gpa.alloc_bytes(100000);
+    if raw == null { return 1; }
+    input := string.{ ptr = xx raw, len = 100000 };
+    random := 0x31415926;
+    i := 0;
+    while i < input.len {
+        random = (random ^ (random << 13)) & 0xffffffff;
+        random = random ^ (random >> 17);
+        random = (random ^ (random << 5)) & 0xffffffff;
+        input.ptr[i] = if i % 97 < 72 then ('A' + i % 7).(u8) else random.(u8);
+        i += 1;
+    }
+    flags := 128 | mz.TDEFL_COMPUTE_ADLER32;
+    state := mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, gpa);
+    print("caller-init {} {} {}\n", 0, status_code(state.status()), state.adler());
+    empty : string = .{ ptr = null, len = 0 };
+    first := state.step(input, empty, .finish) catch (e) {
+        state.deinit(); gpa.dealloc_bytes(raw); return 1;
+    };
+    print("caller-first {} {} {} {} {}\n", status_code(state.status()), first.consumed, first.produced,
+          status_code(state.status()), state.adler());
+    packed := mz.ByteWriter.init(gpa);
+    byte_buf : [17]u8 = ---;
+    calls := 0;
+    while state.status() == .okay {
+        progress := state.step(empty, string.{ ptr = @byte_buf[0], len = byte_buf.len }, .finish) catch (e) {
+            state.deinit(); packed.deinit(); gpa.dealloc_bytes(raw); return 1;
+        };
+        if progress.produced > 0 { packed.put_bytes(string.{ ptr = @byte_buf[0], len = progress.produced }); }
+        calls += 1;
+        if calls > 120000 { state.deinit(); packed.deinit(); gpa.dealloc_bytes(raw); return 1; }
+    }
+    packed_bytes := packed.take();
+    print("caller-drain {} {} {} {} {} {}\n", calls, packed_bytes.len, status_code(state.status()),
+          status_code(state.status()), state.adler(), mz.crc32(packed_bytes));
+    post_code := 99;
+    post := state.step(empty, string.{ ptr = @byte_buf[0], len = byte_buf.len }, .finish) catch (e) {
+        post_code = status_code(state.status());
+        mz.StreamProgress.{ consumed = 0, produced = 0, status = .done }
+    };
+    print("caller-post {} {} {} {}\n", post_code, post.consumed, post.produced, status_code(state.status()));
+    state.deinit();
+    gpa.dealloc_bytes(packed_bytes.ptr);
+
+    ok_sink := SinkState.{ out = mz.ByteWriter.init(gpa), calls = 0, fail_after = -1 };
+    state = mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, gpa);
+    ok_progress := state.step_to_output(input, mz.TdeflSink.{ ctx = xx @ok_sink, write = sink_write }, .finish) catch (e) {
+        state.deinit(); ok_sink.out.deinit(); gpa.dealloc_bytes(raw); return 1;
+    };
+    ok_bytes := ok_sink.out.take();
+    print("callback-ok {} {} {} {} {} {}\n", status_code(state.status()), status_code(state.status()),
+          state.adler(), ok_sink.calls, ok_bytes.len, mz.crc32(ok_bytes));
+    state.deinit();
+    gpa.dealloc_bytes(ok_bytes.ptr);
+
+    fail_sink := SinkState.{ out = mz.ByteWriter.init(gpa), calls = 0, fail_after = 0 };
+    state = mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, gpa);
+    failed := state.step_to_output(input, mz.TdeflSink.{ ctx = xx @fail_sink, write = sink_write }, .finish) catch (e) {
+        mz.StreamProgress.{ consumed = 0, produced = 0, status = .done }
+    };
+    print("callback-fail {} {} {} {} {}\n", status_code(state.status()), status_code(state.status()),
+          state.adler(), fail_sink.calls, fail_sink.out.bytes.len);
+    follow_code := 99;
+    follow := state.step_to_output(empty, mz.TdeflSink.{ ctx = xx @fail_sink, write = sink_write }, .finish) catch (e) {
+        follow_code = status_code(state.status());
+        mz.StreamProgress.{ consumed = 0, produced = 0, status = .done }
+    };
+    print("callback-follow {} {}\n", follow_code, status_code(state.status()));
+    state.deinit();
+    fail_sink.out.deinit();
+
+    state = mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, gpa);
+    requested := state.step(input, empty, .finish) catch (e) {
+        state.deinit(); gpa.dealloc_bytes(raw); return 1;
+    };
+    print("finish-request {} {} {} {} {}\n", status_code(state.status()), requested.consumed, requested.produced,
+          status_code(state.status()), state.adler());
+    mismatch_code := 99;
+    mismatch := state.step(empty, empty, .none) catch (e) {
+        mismatch_code = status_code(state.status());
+        mz.StreamProgress.{ consumed = 0, produced = 0, status = .done }
+    };
+    print("finish-mismatch {} {} {} {}\n", mismatch_code, mismatch.consumed, mismatch.produced, status_code(state.status()));
+    state.deinit();
+
+    gpa.dealloc_bytes(raw);
+    if gpa.alloc_count != 0 { print("leaks {}\n", gpa.alloc_count); return 1; }
+    0
+}

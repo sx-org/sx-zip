@@ -1,0 +1,81 @@
+#import "modules/std/core.sx";
+raw_deflate :: #import "../modules/miniz/raw_deflate.sx";
+raw_inflate :: #import "../modules/miniz/raw_inflate.sx";
+zip_reader :: #import "../modules/miniz/zip_reader.sx";
+zip_writer :: #import "../modules/miniz/zip_memory_writer.sx";
+
+guard_lib :: #library "c";
+heap_call_count :: () -> i64 extern guard_lib "miniz_heap_call_count";
+
+Bump :: struct {
+    data: [*]u8;
+    len: i64;
+    at: i64;
+}
+
+impl Allocator for Bump {
+    alloc_bytes :: (self: *Bump, size: i64) -> *void {
+        aligned := (size + 7) & (0 - 8);
+        if size < 0 or aligned < size or self.at > self.len - aligned { return null; }
+        result := @self.data[self.at];
+        self.at += aligned;
+        result
+    }
+    dealloc_bytes :: (self: *Bump, ptr: *void) {}
+}
+
+same :: (a: string, b: string) -> bool {
+    if a.len != b.len { return false; }
+    i := 0;
+    while i < a.len {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    true
+}
+
+main :: () -> i32 {
+    // MINIZ_NO_MALLOC equivalent: all codec storage comes from caller-owned
+    // stack buffers. No default allocator call is reachable from this binary.
+    workspace : [1048576]u8 = ---;
+    bump := Bump.{ data = @workspace[0], len = workspace.len, at = 0 };
+    alloc : Allocator = xx bump;
+    source := "optional-build-surfaces: optional-build-surfaces";
+    flags := raw_deflate.create_flags(6, -15, raw_deflate.Strategy.default);
+    result := raw_deflate.compress_flags(source, flags, false, raw_deflate.Path.fastest, alloc);
+    if result.bytes.ptr == null { return 1; }
+    decoded : [128]u8 = ---;
+    made, consumed := raw_inflate.inflate_fixed(
+        result.bytes, string.{ ptr = @decoded[0], len = decoded.len }, false, alloc,
+    ) catch (e) { return 2; };
+    if consumed != result.bytes.len or !same(source, string.{ ptr = @decoded[0], len = made }) { return 3; }
+
+    // MINIZ_NO_STDIO, MINIZ_NO_TIME, and no-archive-writing equivalents:
+    // construct and consume an archive entirely in memory with time disabled.
+    files : [1]zip_writer.Input = .[
+        .{ name = "payload.txt", data = source, method = zip_writer.Method.deflate, level = 6 },
+    ];
+    archive := zip_writer.create_archive_without_time(files, alloc) catch (e) { return 4; };
+    reader := zip_reader.open_memory(archive) catch (e) { return 5; };
+    if reader.num_files() != 1 { return 6; }
+    fixed : [128]u8 = ---;
+    n := reader.extract_into_with_read_buffer(
+        0, string.{ ptr = @fixed[0], len = fixed.len },
+        zip_reader.ExtractOptions.{}, string.{ ptr = null, len = 0 }, alloc,
+    ) catch (e) { return 7; };
+    if !same(source, string.{ ptr = @fixed[0], len = n }) { return 8; }
+
+    // Sorted duplicate lookup is allocation-bearing in upstream too. Prove
+    // that its native mapping uses the caller's arena instead of the ambient
+    // allocator, including the default case-insensitive lookup path.
+    duplicate_files : [2]zip_writer.Input = .[
+        .{ name = "same", data = "first", method = .store, level = 0 },
+        .{ name = "same", data = "second", method = .store, level = 0 },
+    ];
+    duplicate_archive := zip_writer.create_archive_without_time(duplicate_files, alloc) catch (e) { return 9; };
+    duplicate_reader := zip_reader.open_memory(duplicate_archive) catch (e) { return 10; };
+    duplicate_index := duplicate_reader.find_options_alloc("same", "", .{}, alloc) catch (e) { return 11; };
+    if duplicate_index < 0 or duplicate_index > 1 { return 12; }
+    if heap_call_count() != 0 { return 13; }
+    0
+}

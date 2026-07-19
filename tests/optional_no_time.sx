@@ -1,0 +1,13 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    files : [2]mz.ZipInput = .[
+        .{ name = "payload.txt", data = "optional-build-surfaces: optional-build-surfaces", method = .deflate, level = 6 },
+        .{ name = "empty", data = "", method = .store, level = 0 },
+    ];
+    archive := mz.create_zip_without_time(files, context.allocator) catch (e) { return 1; };
+    out(archive);
+    context.allocator.dealloc_bytes(archive.ptr);
+    0
+}

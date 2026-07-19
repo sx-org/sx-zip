@@ -1,0 +1,133 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+mode_code :: (v: mz.ZipMode) -> i64 {
+    if v == .reading { return 1; }
+    if v == .writing { return 2; }
+    if v == .finalized { return 3; }
+    0
+}
+
+type_code :: (v: mz.ZipStorageType) -> i64 {
+    if v == .user { return 1; }
+    if v == .memory { return 2; }
+    if v == .heap { return 3; }
+    if v == .file { return 4; }
+    if v == .cfile { return 5; }
+    0
+}
+
+reader_result :: (out: *mz.ByteWriter, ok: bool, r: *mz.ZipReader) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(r.take_last_error()));
+}
+
+writer_result :: (out: *mz.ByteWriter, ok: bool, w: *mz.ZipWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(w.take_last_error()));
+}
+
+reader_snapshot :: (out: *mz.ByteWriter, r: *mz.ZipReader) {
+    out.put_u32le(mode_code(r.mode())); out.put_u32le(type_code(r.storage_type()));
+    out.put_u32le(r.num_files()); out.put_u64le(r.size()); out.put_u64le(r.archive_file_start());
+    out.put_u64le(r.central_directory_size()); out.put_u32le(if r.is_zip64() then 1 else 0);
+    out.put_u32le(0); out.put_u32le(mz.zip_error_code(r.peek_last_error()));
+}
+
+writer_snapshot :: (out: *mz.ByteWriter, w: *mz.ZipWriter) {
+    out.put_u32le(mode_code(w.mode())); out.put_u32le(type_code(w.storage_type()));
+    out.put_u32le(w.num_files()); out.put_u64le(w.size()); out.put_u64le(w.archive_file_start());
+    out.put_u64le(w.central_directory_size()); out.put_u32le(if w.is_zip64() then 1 else 0);
+    out.put_u32le(0); out.put_u32le(mz.zip_error_code(w.peek_last_error()));
+}
+
+reader_read :: (out: *mz.ByteWriter, r: *mz.ZipReader, buf: string, size: i64, bytes: bool) {
+    made := r.read_archive_data(0, string.{ ptr = buf.ptr, len = size }) catch (e) 0;
+    out.put_u64le(made);
+    if bytes { out.put_bytes(string.{ ptr = buf.ptr, len = size }); }
+    out.put_u32le(mz.zip_error_code(r.take_last_error()));
+}
+
+writer_read :: (out: *mz.ByteWriter, w: *mz.ZipWriter, buf: string, size: i64, bytes: bool) {
+    made := w.read_archive_data(0, string.{ ptr = buf.ptr, len = size }) catch (e) 0;
+    out.put_u64le(made);
+    if bytes { out.put_bytes(string.{ ptr = buf.ptr, len = size }); }
+    out.put_u32le(mz.zip_error_code(w.take_last_error()));
+}
+
+zero_snapshot :: (out: *mz.ByteWriter) {
+    out.put_u32le(0); out.put_u32le(0); out.put_u32le(0);
+    out.put_u64le(0); out.put_u64le(0); out.put_u64le(0);
+    out.put_u32le(0); out.put_u32le(0); out.put_u32le(0);
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    out := mz.ByteWriter.init(gpa);
+    maybe_base := fs.read_file("/tmp/miniz-zip-lifecycle-base.zip");
+    if maybe_base == null { out.deinit(); return 1; }
+    base := maybe_base!;
+    scratch : [512]u8 = ---;
+
+    zero_snapshot(@out); out.put_u32le(0); zero_snapshot(@out);
+
+    reader := mz.open_zip(base) catch (e) { context.allocator.dealloc_bytes(base.ptr); out.deinit(); return 1; };
+    reader_result(@out, true, @reader); reader_snapshot(@out, @reader);
+    reader_read(@out, @reader, string.{ ptr = @scratch[0], len = scratch.len }, 4, true);
+    ok := true; reader.reinit(base) catch (e) { ok = false; };
+    reader_result(@out, ok, @reader); reader_snapshot(@out, @reader);
+    reader_result(@out, reader.end(), @reader); reader_snapshot(@out, @reader);
+    reader_result(@out, reader.end(), @reader); reader_snapshot(@out, @reader);
+    ok = true; reader.reinit(base) catch (e) { ok = false; };
+    reader_result(@out, ok, @reader); reader_snapshot(@out, @reader);
+    reader_result(@out, reader.end(), @reader);
+
+    ordinary := mz.ZipWriter.init(gpa);
+    writer_result(@out, true, @ordinary); writer_snapshot(@out, @ordinary);
+    writer_read(@out, @ordinary, string.{ ptr = @scratch[0], len = scratch.len }, 4, false);
+    writer_result(@out, ordinary.end(), @ordinary);
+
+    writer := mz.ZipWriter.init_readable(gpa);
+    writer_result(@out, true, @writer); writer_snapshot(@out, @writer);
+    ok = true; writer.add_options("x", "abc", mz.ZipEntryOptions.{ method = .store, level = 0 }) catch (e) { ok = false; };
+    writer_result(@out, ok, @writer); writer_snapshot(@out, @writer);
+    writer_read(@out, @writer, string.{ ptr = @scratch[0], len = scratch.len }, 4, true);
+    ok = true; writer.finalize() catch (e) { ok = false; };
+    writer_result(@out, ok, @writer); writer_snapshot(@out, @writer);
+    made := writer.read_archive_data(0, string.{ ptr = @scratch[0], len = scratch.len }) catch (e) 0;
+    out.put_u64le(made); out.put_u32le(mz.crc32(string.{ ptr = @scratch[0], len = made }));
+    ok = true; writer.add("y", "z", .store, 0) catch (e) { ok = false; };
+    writer_result(@out, ok, @writer);
+    writer_result(@out, writer.end(), @writer); writer_snapshot(@out, @writer);
+    writer_result(@out, writer.end(), @writer); writer_snapshot(@out, @writer);
+
+    zip64 := mz.ZipWriter.init_zip64_readable(gpa);
+    writer_result(@out, true, @zip64); writer_snapshot(@out, @zip64);
+    ok = true; zip64.finalize() catch (e) { ok = false; };
+    writer_result(@out, ok, @zip64); writer_snapshot(@out, @zip64);
+    made = zip64.read_archive_data(0, string.{ ptr = @scratch[0], len = scratch.len }) catch (e) 0;
+    out.put_u64le(made); out.put_u32le(mz.crc32(string.{ ptr = @scratch[0], len = made }));
+    writer_result(@out, zip64.end(), @zip64);
+
+    source := mz.open_zip(base) catch (e) { context.allocator.dealloc_bytes(base.ptr); out.deinit(); return 1; };
+    reader_result(@out, true, @source); reader_snapshot(@out, @source);
+    update := mz.zip_writer_from_reader(@source, false, gpa) catch (e) { context.allocator.dealloc_bytes(base.ptr); out.deinit(); return 1; };
+    writer_result(@out, true, @update); writer_snapshot(@out, @update);
+    writer_read(@out, @update, string.{ ptr = @scratch[0], len = scratch.len }, 4, true);
+    ok = true; update.add_options("y", "def", mz.ZipEntryOptions.{ method = .store, level = 0 }) catch (e) { ok = false; };
+    writer_result(@out, ok, @update);
+    ok = true; update.finalize() catch (e) { ok = false; };
+    writer_result(@out, ok, @update); writer_snapshot(@out, @update);
+    made = update.read_archive_data(0, string.{ ptr = @scratch[0], len = scratch.len }) catch (e) 0;
+    out.put_u64le(made); out.put_u32le(mz.crc32(string.{ ptr = @scratch[0], len = made }));
+    writer_result(@out, update.end(), @update);
+
+    bytes := out.take();
+    wrote := fs.write_file("/tmp/sx-zip-lifecycle.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr); context.allocator.dealloc_bytes(base.ptr);
+    if !wrote or gpa.alloc_count != 0 {
+        print("zip lifecycle leaks/write: wrote={} allocations={}\n", wrote, gpa.alloc_count);
+        return 1;
+    }
+    0
+}

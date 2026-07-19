@@ -1,0 +1,126 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+put_state :: (out: *mz.ByteWriter, ok: bool, errors: *mz.ZipErrorState) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(errors.take()));
+}
+
+no_read_case :: (out: *mz.ByteWriter, reader: *mz.ZipReader, index: i64, compressed: bool, alloc: Allocator) {
+    reader.errors.clear();
+    options := mz.ZipExtractOptions.{ compressed_data = compressed };
+    ok := true; empty : mz.ZipExtractIterator = ---;
+    it := mz.zip_extract_iter(reader, index, options, 1073741824, alloc) catch (e) { ok = false; empty };
+    put_state(out, ok, @reader.errors);
+    if ok { put_state(out, it.free(), @reader.errors); }
+}
+
+read_case :: (out: *mz.ByteWriter, reader: *mz.ZipReader, index: i64, compressed: bool, first_size: i64, drain: bool, alloc: Allocator) {
+    reader.errors.clear();
+    options := mz.ZipExtractOptions.{ compressed_data = compressed };
+    ok := true; empty : mz.ZipExtractIterator = ---;
+    it := mz.zip_extract_iter(reader, index, options, 1073741824, alloc) catch (e) { ok = false; empty };
+    put_state(out, ok, @reader.errors);
+    if !ok { return; }
+    buf : [120000]u8 = ---;
+    made_ok := true;
+    made := it.read(string.{ ptr = @buf[0], len = first_size }) catch (e) { made_ok = false; 0 };
+    total := made;
+    checksum := mz.crc32(string.{ ptr = @buf[0], len = made });
+    out.put_u32le(made); out.put_u32le(checksum); out.put_u32le(mz.zip_error_code(reader.errors.take()));
+    if drain and made_ok {
+        while true {
+            made = it.read(string.{ ptr = @buf[0], len = 997 }) catch (e) { made_ok = false; 0 };
+            total += made;
+            checksum = mz.crc32(string.{ ptr = @buf[0], len = made }, checksum);
+            if made == 0 { break; }
+        }
+        out.put_u32le(total); out.put_u32le(checksum); out.put_u32le(mz.zip_error_code(reader.errors.take()));
+    }
+    put_state(out, it.free(), @reader.errors);
+}
+
+corrupt_case :: (out: *mz.ByteWriter, path: [:0]u8, index: i64, alloc: Allocator) -> bool {
+    maybe := fs.read_file(path); if maybe == null { return false; }
+    archive := maybe!;
+    reader := mz.open_zip(archive) catch (e) { context.allocator.dealloc_bytes(archive.ptr); return false; };
+    put_state(out, true, @reader.errors);
+    iter_ok := true; empty_iter : mz.ZipExtractIterator = ---;
+    it := mz.zip_extract_iter(@reader, index, mz.ZipExtractOptions.{}, 1073741824, alloc) catch (e) { iter_ok = false; empty_iter };
+    put_state(out, iter_ok, @reader.errors);
+    buf : [120000]u8 = ---;
+    made := if iter_ok then it.read(string.{ ptr = @buf[0], len = buf.len }) catch (e) 0 else 0;
+    out.put_u32le(made); out.put_u32le(mz.zip_error_code(reader.errors.take()));
+    if iter_ok { put_state(out, it.free(), @reader.errors); }
+    put_state(out, reader.end(), @reader.errors);
+    context.allocator.dealloc_bytes(archive.ptr);
+    true
+}
+
+unsupported_case :: (out: *mz.ByteWriter, path: [:0]u8, alloc: Allocator) -> bool {
+    maybe := fs.read_file(path); if maybe == null { return false; }
+    archive := maybe!;
+    reader := mz.open_zip(archive) catch (e) { context.allocator.dealloc_bytes(archive.ptr); return false; };
+    put_state(out, true, @reader.errors);
+    empty : mz.ZipExtractIterator = ---;
+    ok := true; it := mz.zip_extract_iter(@reader, 0, .{}, 1073741824, alloc) catch (e) { ok = false; empty };
+    put_state(out, ok, @reader.errors); if ok { put_state(out, it.free(), @reader.errors); }
+    ok = true; it = mz.zip_extract_iter(@reader, 0, .{ compressed_data = true }, 1073741824, alloc) catch (e) { ok = false; empty };
+    put_state(out, ok, @reader.errors); if ok { put_state(out, it.free(), @reader.errors); }
+    put_state(out, reader.end(), @reader.errors);
+    context.allocator.dealloc_bytes(archive.ptr);
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    maybe := fs.read_file("/tmp/miniz-zip-iterator.zip");
+    if maybe == null { out.deinit(); return 1; }
+    archive := maybe!;
+    reader := mz.open_zip(archive) catch (e) { context.allocator.dealloc_bytes(archive.ptr); out.deinit(); return 1; };
+    put_state(@out, true, @reader.errors);
+
+    iter_ok := true; empty_iter : mz.ZipExtractIterator = ---;
+    it := mz.zip_extract_iter(@reader, 99, mz.ZipExtractOptions.{}, 1073741824, gpa) catch (e) { iter_ok = false; empty_iter };
+    put_state(@out, iter_ok, @reader.errors);
+    iter_ok = true;
+    it = mz.zip_extract_name_iter(@reader, "missing", mz.ZipExtractOptions.{}, 1073741824, gpa) catch (e) { iter_ok = false; empty_iter };
+    put_state(@out, iter_ok, @reader.errors);
+    iter_ok = true;
+    it = mz.zip_extract_name_iter(@reader, "deflated", mz.ZipExtractOptions.{ locate = .{ ignore_path = true } }, 1073741824, gpa) catch (e) { iter_ok = false; empty_iter };
+    put_state(@out, iter_ok, @reader.errors);
+    if iter_ok { put_state(@out, it.free(), @reader.errors); }
+    iter_ok = true;
+    it = mz.zip_extract_name_iter(@reader, "dir/deflated", mz.ZipExtractOptions.{ locate = .{ case_sensitive = true } }, 1073741824, gpa) catch (e) { iter_ok = false; empty_iter };
+    put_state(@out, iter_ok, @reader.errors);
+
+    no_read_case(@out, @reader, 0, false, gpa);
+    read_case(@out, @reader, 0, false, 0, false, gpa);
+    read_case(@out, @reader, 0, false, 1, false, gpa);
+    read_case(@out, @reader, 0, false, 120000, false, gpa);
+    read_case(@out, @reader, 0, false, 1, true, gpa);
+    no_read_case(@out, @reader, 0, true, gpa);
+    read_case(@out, @reader, 0, true, 1, false, gpa);
+
+    no_read_case(@out, @reader, 1, false, gpa);
+    read_case(@out, @reader, 1, false, 0, false, gpa);
+    read_case(@out, @reader, 1, false, 1, false, gpa);
+    read_case(@out, @reader, 1, false, 120000, false, gpa);
+    read_case(@out, @reader, 1, false, 1, true, gpa);
+    no_read_case(@out, @reader, 1, true, gpa);
+    read_case(@out, @reader, 1, true, 1, false, gpa);
+
+    put_state(@out, reader.end(), @reader.errors);
+    context.allocator.dealloc_bytes(archive.ptr);
+    if !corrupt_case(@out, "/tmp/miniz-zip-iterator-corrupt-0.zip", 0, gpa) or
+       !corrupt_case(@out, "/tmp/miniz-zip-iterator-corrupt-1.zip", 1, gpa) or
+       !unsupported_case(@out, "/tmp/miniz-zip-iterator-unsupported-0.zip", gpa) or
+       !unsupported_case(@out, "/tmp/miniz-zip-iterator-unsupported-1.zip", gpa) or
+       !unsupported_case(@out, "/tmp/miniz-zip-iterator-unsupported-2.zip", gpa) {
+        out.deinit(); return 1;
+    }
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-iterator.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

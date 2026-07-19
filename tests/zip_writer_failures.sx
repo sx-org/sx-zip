@@ -1,0 +1,154 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SinkState :: struct {
+    fail_kind: i64;
+    calls: i64;
+    accepted: i64;
+    checksum: i64;
+    saw_local: bool;
+    saw_descriptor: bool;
+    local_count: i64;
+}
+
+SourceState :: struct { mode: i64; calls: i64; trace: i64; }
+
+read32 :: (data: string) -> i64 {
+    if data.len < 4 { return 0; }
+    data[0].(i64) | (data[1].(i64) << 8) | (data[2].(i64) << 16) | (data[3].(i64) << 24)
+}
+
+kind_of :: (state: *SinkState, data: string) -> i64 {
+    sig := read32(data);
+    if sig == 0x04034b50 {
+        state.saw_local = true; state.local_count += 1;
+        return if state.local_count > 1 then 6 else 1;
+    }
+    if sig == 0x08074b50 { state.saw_descriptor = true; return 3; }
+    if sig == 0x02014b50 { return 4; }
+    if sig == 0x06054b50 { return 5; }
+    if state.saw_local and !state.saw_descriptor { return 2; }
+    0
+}
+
+sink_write :: (ctx: *void, data: string) -> bool {
+    state : *SinkState = xx ctx;
+    state.calls += 1;
+    if kind_of(state, data) == state.fail_kind { return false; }
+    state.accepted += data.len;
+    state.checksum = mz.crc32(data, state.checksum);
+    true
+}
+
+sink_write_at :: (ctx: *void, offset: i64, data: string) -> bool {
+    sink_write(ctx, data)
+}
+
+put_u64_bytes :: (bytes: *[16]u8, at: i64, value: i64) {
+    i := 0; while i < 8 { bytes[at + i] = ((value >> (i * 8)) & 0xff).(u8); i += 1; }
+}
+
+source_read :: (ctx: *void, offset: i64, output: string) -> i64 {
+    state : *SourceState = xx ctx;
+    state.calls += 1;
+    trace_bytes : [16]u8 = ---;
+    put_u64_bytes(@trace_bytes, 0, offset); put_u64_bytes(@trace_bytes, 8, output.len);
+    state.trace = mz.crc32(string.{ ptr = @trace_bytes[0], len = trace_bytes.len }, state.trace);
+    if state.mode == 1 or (state.mode == 3 and state.calls == 2) { return output.len + 1; }
+    if state.mode == 2 { return 0; }
+    take := output.len; if take > 7 { take = 7; }
+    if offset >= 123 { take = 0; }
+    else if take > 123 - offset { take = 123 - offset; }
+    i := 0; while i < take { output.ptr[i] = (((offset + i) * 29 + 7) & 0xff).(u8); i += 1; }
+    take
+}
+
+mode_code :: (mode: mz.ZipMode) -> i64 {
+    if mode == .reading { return 1; }
+    if mode == .writing { return 2; }
+    if mode == .finalized { return 3; }
+    0
+}
+
+result :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+snapshot :: (out: *mz.ByteWriter, writer: *mz.ZipStreamWriter, sink: *SinkState) {
+    out.put_u32le(mode_code(writer.mode())); out.put_u32le(writer.num_files());
+    out.put_u64le(writer.size()); out.put_u64le(writer.central_directory_size());
+    out.put_u32le(if writer.is_zip64() then 1 else 0);
+    out.put_u32le(sink.calls); out.put_u64le(sink.accepted); out.put_u32le(sink.checksum);
+    out.put_u32le(mz.zip_error_code(writer.peek_last_error()));
+}
+
+run_case :: (out: *mz.ByteWriter, fail_kind: i64, alloc: Allocator) {
+    state := SinkState.{ fail_kind = fail_kind, calls = 0, accepted = 0, checksum = 0, saw_local = false, saw_descriptor = false, local_count = 0 };
+    sink := mz.ZipSink.{ ctx = xx @state, write = sink_write };
+    writer := mz.ZipStreamWriter.init(sink, alloc);
+    result(out, true, @writer);
+    options := mz.ZipEntryOptions.{ method = .deflate, level = 9, time_mode = .none };
+    add_ok := true;
+    writer.add_options("entry", "writer callback failure payload writer callback failure payload writer callback failure payload writer callback failure payload", options) catch (e) { add_ok = false; };
+    result(out, add_ok, @writer); snapshot(out, @writer, @state);
+    finish_ok := true;
+    writer.finish() catch (e) { finish_ok = false; };
+    result(out, finish_ok, @writer); snapshot(out, @writer, @state);
+    if fail_kind == 4 or fail_kind == 5 {
+        state.fail_kind = 0; finish_ok = true;
+        writer.finish() catch (e) { finish_ok = false; };
+        result(out, finish_ok, @writer); snapshot(out, @writer, @state);
+    }
+    result(out, writer.end(), @writer); snapshot(out, @writer, @state);
+}
+
+run_source_case :: (out: *mz.ByteWriter, mode: i64, level: i64, alloc: Allocator) {
+    sink_state := SinkState.{ fail_kind = 0, calls = 0, accepted = 0, checksum = 0, saw_local = false, saw_descriptor = false, local_count = 0 };
+    sink := mz.ZipSink.{ ctx = xx @sink_state, write = sink_write };
+    writer := mz.ZipStreamWriter.init(sink, alloc);
+    result(out, true, @writer);
+    source_state := SourceState.{ mode = mode, calls = 0, trace = 0 };
+    source := mz.ZipInputSource.{ ctx = xx @source_state, size = 123, read = source_read };
+    options := mz.ZipEntryOptions.{ method = if level == 0 then .store else .deflate, level = level, time_mode = .none };
+    add_ok := true;
+    writer.add_source("source", source, options) catch (e) { add_ok = false; };
+    result(out, add_ok, @writer); snapshot(out, @writer, @sink_state);
+    out.put_u32le(source_state.calls); out.put_u32le(source_state.trace);
+    finish_ok := true; writer.finish() catch (e) { finish_ok = false; };
+    result(out, finish_ok, @writer); snapshot(out, @writer, @sink_state);
+    result(out, writer.end(), @writer); snapshot(out, @writer, @sink_state);
+}
+
+run_patch_case :: (out: *mz.ByteWriter, fail_kind: i64, alloc: Allocator) {
+    sink_state := SinkState.{ fail_kind = fail_kind, calls = 0, accepted = 0, checksum = 0, saw_local = false, saw_descriptor = false, local_count = 0 };
+    sink := mz.ZipSink.{ ctx = xx @sink_state, write = sink_write, write_at = sink_write_at };
+    writer := mz.ZipStreamWriter.init(sink, alloc);
+    result(out, true, @writer);
+    source_state := SourceState.{ mode = 0, calls = 0, trace = 0 };
+    source := mz.ZipInputSource.{ ctx = xx @source_state, size = 123, read = source_read };
+    options := mz.ZipEntryOptions.{ method = .deflate, level = 9, time_mode = .none, data_descriptor = false };
+    add_ok := true; writer.add_source("patched", source, options) catch (e) { add_ok = false; };
+    result(out, add_ok, @writer); snapshot(out, @writer, @sink_state);
+    out.put_u32le(source_state.calls); out.put_u32le(source_state.trace);
+    finish_ok := true; writer.finish() catch (e) { finish_ok = false; };
+    result(out, finish_ok, @writer); snapshot(out, @writer, @sink_state);
+    result(out, writer.end(), @writer); snapshot(out, @writer, @sink_state);
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    kind := 0; while kind <= 5 { run_case(@out, kind, gpa); kind += 1; }
+    run_source_case(@out, 0, 9, gpa);
+    run_source_case(@out, 1, 0, gpa);
+    run_source_case(@out, 1, 9, gpa);
+    run_source_case(@out, 2, 0, gpa);
+    run_source_case(@out, 2, 9, gpa);
+    run_source_case(@out, 3, 9, gpa);
+    run_patch_case(@out, 0, gpa);
+    run_patch_case(@out, 6, gpa);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-writer-failures.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

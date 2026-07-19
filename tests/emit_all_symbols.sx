@@ -1,0 +1,95 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+DISTANCES : [30]i64 : .[1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577];
+LENGTHS : [29]i64 : .[3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
+
+emit_case :: (history: i64, length: i64, distance: i64, dynamic: bool, bundle: *mz.ByteWriter, alloc: Allocator) -> bool {
+    stream := mz.BitWriter.init(alloc);
+    // A non-final fixed block seeds exactly the history required by the match
+    // in the following block. Keeping the tdefl token block itself small
+    // respects upstream's 32 KiB block-construction invariant.
+    stream.write(0, 1); stream.write(1, 2);
+    i := 0;
+    while i < history { mz.emit_fixed_symbol(@stream, 'A'); i += 1; }
+    mz.emit_fixed_symbol(@stream, 256);
+
+    tokens := mz.TdeflTokenBuffer.init(alloc, true, false);
+    tokens.match(length, distance, alloc);
+    tokens.finish_flags();
+    block : string = ---;
+    valid_bits := 0;
+    if dynamic {
+        bytes, bits := mz.emit_tdefl_dynamic(@tokens, true, alloc);
+        block = bytes; valid_bits = bits;
+    } else {
+        bytes, bits := mz.emit_tdefl_fixed(@tokens, true, alloc);
+        block = bytes; valid_bits = bits;
+    }
+    tokens.deinit(alloc);
+    if block.ptr == null { print("symbol block allocation failed h={} l={} d={} dyn={}\n", history, length, distance, dynamic); stream.out.deinit(); return false; }
+    bit := 0;
+    while bit < valid_bits {
+        stream.write((block[bit / 8].(i64) >> (bit & 7)) & 1, 1);
+        bit += 1;
+    }
+    alloc.dealloc_bytes(block.ptr);
+    packed := stream.finish();
+    expected := history + length;
+    plain := mz.inflate(packed, expected, alloc) catch (e) {
+        print("symbol inflate failed h={} l={} d={} dyn={} err={} packed={}\n", history, length, distance, dynamic, e, packed.len);
+        alloc.dealloc_bytes(packed.ptr); return false;
+    };
+    ok := plain.len == expected;
+    i = 0;
+    while ok and i < plain.len { ok = plain[i] == 'A'; i += 1; }
+    if !ok {
+        print("symbol payload failed h={} l={} d={} dyn={} made={} expected={} first={}/{}/{}/{}\n", history, length, distance, dynamic, plain.len, expected,
+            if plain.len > 0 then plain[0] else 0, if plain.len > 1 then plain[1] else 0,
+            if plain.len > 2 then plain[2] else 0, if plain.len > 3 then plain[3] else 0);
+    }
+    if ok {
+        bundle.put_u32le(expected);
+        bundle.put_u32le(packed.len);
+        bundle.put_bytes(packed);
+    }
+    alloc.dealloc_bytes(plain.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    bundle := mz.ByteWriter.init(gpa);
+    dynamic_index := 0;
+    ok := true;
+    while dynamic_index < 2 and ok {
+        dynamic := dynamic_index == 1;
+        index := 0;
+        while index < 30 and ok {
+            base := DISTANCES[index];
+            high := if index + 1 < 30 then DISTANCES[index + 1] - 1 else 32768;
+            ok = emit_case(base, 3, base, dynamic, @bundle, gpa);
+            if ok and high != base { ok = emit_case(high, 3, high, dynamic, @bundle, gpa); }
+            index += 1;
+        }
+        index = 0;
+        while index < 29 and ok {
+            base := LENGTHS[index];
+            high := if index + 1 < 29 then LENGTHS[index + 1] - 1 else 258;
+            ok = emit_case(1, base, 1, dynamic, @bundle, gpa);
+            if ok and high != base { ok = emit_case(1, high, 1, dynamic, @bundle, gpa); }
+            index += 1;
+        }
+        dynamic_index += 1;
+    }
+    bytes := bundle.take();
+    wrote := ok and fs.write_file("/tmp/sx-miniz-all-symbols.bin", bytes);
+    if bytes.ptr != null { gpa.dealloc_bytes(bytes.ptr); }
+    if !wrote or gpa.alloc_count != 0 {
+        print("all-symbol emission failed ok={} wrote={} leaks={}\n", ok, wrote, gpa.alloc_count);
+        return 1;
+    }
+    print("all tdefl length/distance symbols and extra-bit maxima ok\n");
+    0
+}

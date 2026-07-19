@@ -1,0 +1,101 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+fs :: #import "modules/std/fs.sx";
+libc :: #import "modules/std/c.sx";
+
+record_reader :: (out: *mz.ByteWriter, ok: bool, reader: *mz.ZipReader) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(reader.take_last_error()));
+}
+
+record_writer :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+record_stream :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    writer := mz.ZipWriter.init(gpa);
+    writer.add_options("payload", "filesystem adapter failure payload filesystem adapter failure payload",
+        mz.ZipEntryOptions.{ method = .deflate, level = 6, time_mode = .none }) catch (e) { writer.deinit(); out.deinit(); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); out.deinit(); return 1; };
+    reader := mz.open_zip(archive) catch (e) { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; };
+    record_reader(@out, true, @reader);
+    path_ok := true;
+    ignored_path := mz.zip_extract_to_file(@reader, 0, "/tmp/miniz-missing-dir/out", mz.ZipExtractOptions.{}, 1000, gpa) catch (e) { path_ok = false; 0 };
+    record_reader(@out, path_ok, @reader);
+    maybe_sink := fs.open_file("/tmp/sx-miniz-closed-output", .write);
+    if maybe_sink == null { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    sink := maybe_sink!;
+    if libc.close(sink.fd) != 0 { gpa.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    sink_ok := true;
+    ignored_sink := mz.zip_extract_to_handle(@reader, 0, @sink, mz.ZipExtractOptions.{}, 1000, gpa) catch (e) { sink_ok = false; 0 };
+    record_reader(@out, sink_ok, @reader);
+    sink.close(); fs.delete_file("/tmp/sx-miniz-closed-output");
+    record_reader(@out, reader.end(), @reader);
+    gpa.dealloc_bytes(archive.ptr);
+
+    missing_writer := mz.ZipWriter.init(gpa);
+    record_writer(@out, true, @missing_writer);
+    missing_ok := true;
+    missing_writer.add_file_default("missing", "/tmp/miniz-no-such-input") catch (e) { missing_ok = false; };
+    record_writer(@out, missing_ok, @missing_writer);
+    record_writer(@out, missing_writer.end(), @missing_writer);
+
+    path_writer_ok := true;
+    ignored_owned : mz.OwnedZipWriter = ---;
+    ignored_owned = mz.open_zip_writer_file("/tmp/miniz-missing-dir/out.zip", 0, false, false, gpa) catch (e) {
+        path_writer_ok = false;
+        ignored_owned
+    };
+    out.put_u32le(if path_writer_ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(if path_writer_ok then .no_error else .file_open_failed));
+    if path_writer_ok { ignored_owned.deinit(); }
+
+    maybe_output := fs.open_file("/tmp/sx-miniz-closed-writer", .read_write);
+    if maybe_output == null {
+        if !fs.write_file("/tmp/sx-miniz-closed-writer", "") { out.deinit(); return 1; }
+        maybe_output = fs.open_file("/tmp/sx-miniz-closed-writer", .read_write);
+    }
+    if maybe_output == null { out.deinit(); return 1; }
+    output_file := maybe_output!;
+    owned := mz.open_zip_writer_handle(@output_file, false, false, gpa) catch (e) { out.deinit(); return 1; };
+    record_stream(@out, true, @owned.writer);
+    if libc.close(output_file.fd) != 0 { owned.deinit(); out.deinit(); return 1; }
+    add_ok := true; owned.writer.add("entry", "data", .store, 0) catch (e) { add_ok = false; };
+    record_stream(@out, add_ok, @owned.writer);
+    finish_ok := true; owned.finish() catch (e) { finish_ok = false; };
+    record_stream(@out, finish_ok, @owned.writer);
+    record_stream(@out, owned.end(), @owned.writer);
+    output_file.close(); fs.delete_file("/tmp/sx-miniz-closed-writer");
+
+    if !fs.write_file("/tmp/sx-miniz-closed-source", "source") { out.deinit(); return 1; }
+    maybe_source := fs.open_file("/tmp/sx-miniz-closed-source", .read);
+    if maybe_source == null { out.deinit(); return 1; }
+    source := maybe_source!;
+    if libc.close(source.fd) != 0 { out.deinit(); return 1; }
+    short_writer := mz.ZipWriter.init(gpa);
+    record_writer(@out, true, @short_writer);
+    short_ok := true;
+    short_writer.add_handle("short", @source, 6, mz.ZipEntryOptions.{ method = .store, level = 0, time_mode = .none }) catch (e) { short_ok = false; };
+    record_writer(@out, short_ok, @short_writer);
+    short_finish_ok := true;
+    short_archive := short_writer.finish() catch (e) { short_finish_ok = false; string.{ ptr = null, len = 0 } };
+    record_writer(@out, short_finish_ok, @short_writer);
+    record_writer(@out, short_writer.end(), @short_writer);
+    source.close(); fs.delete_file("/tmp/sx-miniz-closed-source");
+    short_reader := mz.open_zip(short_archive) catch (e) { if short_archive.ptr != null { gpa.dealloc_bytes(short_archive.ptr); } out.deinit(); return 1; };
+    record_reader(@out, true, @short_reader);
+    entry := short_reader.entry(0) catch (e) { gpa.dealloc_bytes(short_archive.ptr); out.deinit(); return 1; };
+    out.put_u32le(entry.size);
+    record_reader(@out, short_reader.end(), @short_reader);
+    gpa.dealloc_bytes(short_archive.ptr);
+
+    bytes := out.take(); ok := fs.write_file("/tmp/sx-miniz-zip-stdio-failures.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if ok and gpa.alloc_count == 0 then 0 else 1
+}

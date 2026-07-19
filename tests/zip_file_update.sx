@@ -1,0 +1,74 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+mode_code :: (v: mz.ZipMode) -> i64 {
+    if v == .reading { return 1; }
+    if v == .writing { return 2; }
+    if v == .finalized { return 3; }
+    0
+}
+
+type_code :: (v: mz.ZipStorageType) -> i64 {
+    if v == .user { return 1; }
+    if v == .memory { return 2; }
+    if v == .heap { return 3; }
+    if v == .file { return 4; }
+    if v == .cfile { return 5; }
+    0
+}
+
+reader_record :: (out: *mz.ByteWriter, ok: bool, r: *mz.ZipReader) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(r.take_last_error()));
+    out.put_u32le(mode_code(r.mode())); out.put_u32le(type_code(r.storage_type())); out.put_u32le(r.num_files());
+}
+
+writer_record :: (out: *mz.ByteWriter, ok: bool, w: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(w.take_last_error()));
+    out.put_u32le(mode_code(w.mode())); out.put_u32le(type_code(w.storage_type())); out.put_u32le(w.num_files());
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    maybe_base := fs.read_file("/tmp/miniz-zip-file-update-base.zip");
+    if maybe_base == null { return 1; }
+    base := maybe_base!;
+    if !fs.write_file("/tmp/sx-zip-file-update.zip", base) { context.allocator.dealloc_bytes(base.ptr); return 1; }
+    context.allocator.dealloc_bytes(base.ptr);
+    out := mz.ByteWriter.init(gpa);
+    owned := mz.open_zip_file_writable("/tmp/sx-zip-file-update.zip", 0, 0, gpa) catch (e) { out.deinit(); return 1; };
+    reader_record(@out, true, @owned.reader);
+    writer := mz.zip_file_writer_from_reader(@owned, false, gpa) catch (e) { owned.deinit(); out.deinit(); return 1; };
+    writer_record(@out, true, @writer);
+    fixed : [32]u8 = ---;
+    extract_ok := true;
+    made := owned.reader.extract_into(0, string.{ ptr = @fixed[0], len = 12 }, mz.ZipExtractOptions.{}, gpa) catch (e) { extract_ok = false; 0 };
+    extract_ok = extract_ok and made == 12 and mz.bytes_equal(string.{ ptr = @fixed[0], len = 12 }, "base payload");
+    // C extraction runs through the converted archive object. Its observable
+    // error/mode/type/count are the writer's, while SX keeps the readable view
+    // as a separate borrowed reader.
+    writer_record(@out, extract_ok, @writer);
+    options := mz.ZipEntryOptions.{ method = .store, level = 0, comment = "new", time_mode = .none };
+    add_ok := true; writer.add_options("added.txt", "new payload", options) catch (e) { add_ok = false; };
+    writer_record(@out, add_ok, @writer);
+    finish_ok := true; writer.finish() catch (e) { finish_ok = false; };
+    writer_record(@out, finish_ok, @writer);
+    writer_record(@out, writer.end(), @writer);
+    owned.deinit();
+    reserved := mz.ZipWriter.init(gpa);
+    reserved_ok := true;
+    reserved.reserve_prefix(4097) catch (e) { reserved_ok = false; };
+    if reserved_ok {
+        reserved.add_options("x", "reserved", mz.ZipEntryOptions.{ method = .store, level = 0, time_mode = .none }) catch (e) { reserved_ok = false; };
+    }
+    reserved_bytes : string = .{ ptr = null, len = 0 };
+    if reserved_ok { reserved_bytes = reserved.finish() catch (e) { reserved_ok = false; string.{ ptr = null, len = 0 } }; }
+    if !reserved_ok or reserved_bytes.ptr == null or !fs.write_file("/tmp/sx-zip-reserved.zip", reserved_bytes) {
+        reserved.deinit(); out.deinit(); return 1;
+    }
+    gpa.dealloc_bytes(reserved_bytes.ptr);
+    bytes := out.take();
+    ok := fs.write_file("/tmp/sx-zip-file-update.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !ok or gpa.alloc_count != 0 { return 1; }
+    0
+}

@@ -1,0 +1,64 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+run_case :: (data: string, path: string, level: i64, strategy: mz.CompressionStrategy, alloc: Allocator) -> bool {
+    packed := mz.compress_strategy(data, level, strategy, alloc);
+    plain := mz.decompress(packed, data.len + 1, alloc) catch (e) {
+        print("strategy decompress failed path={} error={} packed={}\n", path, e, packed.len);
+        alloc.dealloc_bytes(packed.ptr);
+        return false;
+    };
+    same := mz.bytes_equal(data, plain);
+    wrote := fs.write_file(path, packed);
+    if !same or !wrote { print("strategy case failed path={} same={} wrote={} packed={}\n", path, same, wrote, packed.len); }
+    ok := same and wrote;
+    alloc.dealloc_bytes(plain.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    ok
+}
+
+run_path_case :: (data: string, path: string, level: i64, machine_path: mz.DeflatePath, alloc: Allocator) -> bool {
+    packed := mz.compress_path(data, level, .default, machine_path, alloc);
+    plain := mz.decompress(packed, data.len + 1, alloc) catch (e) { alloc.dealloc_bytes(packed.ptr); return false; };
+    ok := mz.bytes_equal(data, plain) and fs.write_file(path, packed);
+    alloc.dealloc_bytes(plain.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    raw := gpa.alloc_bytes(65536);
+    data := string.{ ptr = xx raw, len = 65536 };
+    state := 0x12345678;
+    i := 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        if i % 251 < 190 { data[i] = ('a'.(i64) + ((i / 7) % 11)).(u8); }
+        else { data[i] = state.(u8); }
+        i += 1;
+    }
+
+    ok := true;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-neg1.zlib", -1, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-neg2.zlib", -2, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-0.zlib", 0, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-1.zlib", 1, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-6.zlib", 6, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-10.zlib", 10, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-11.zlib", 11, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-default-99.zlib", 99, .default, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-filtered-6.zlib", 6, .filtered, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-huffman-6.zlib", 6, .huffman_only, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-rle-6.zlib", 6, .rle, gpa) and ok;
+    ok = run_case(data, "/tmp/sx-miniz-strategy-sx-fixed-6.zlib", 6, .fixed, gpa) and ok;
+    ok = run_path_case(data, "/tmp/sx-miniz-strategy-sx-portable-default-1.zlib", 1, .portable, gpa) and ok;
+    ok = run_path_case(data, "/tmp/sx-miniz-strategy-sx-portable-default-6.zlib", 6, .portable, gpa) and ok;
+
+    gpa.dealloc_bytes(raw);
+    if !ok or gpa.alloc_count != 0 { print("strategy corpus failed allocations={}\n", gpa.alloc_count); return 1; }
+    print("strategy corpus ok\n");
+    0
+}

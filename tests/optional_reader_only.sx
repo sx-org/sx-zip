@@ -1,0 +1,11 @@
+#import "modules/std/core.sx";
+zip_reader :: #import "../modules/miniz/zip_reader.sx";
+
+main :: () -> i32 {
+    empty : [22]u8 = .[
+        0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    reader := zip_reader.open_memory(string.{ ptr = @empty[0], len = empty.len }) catch (e) { return 1; };
+    if reader.num_files() == 0 and reader.end() then 0 else 2
+}

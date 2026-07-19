@@ -1,0 +1,9 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    packed := mz.gzip_compress("sx gzip sx gzip sx gzip", 6, context.allocator);
+    ok := fs.write_file("/tmp/sx-miniz-interop.gz", packed);
+    context.allocator.dealloc_bytes(packed.ptr);
+    if ok then 0 else 1
+}

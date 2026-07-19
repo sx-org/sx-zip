@@ -1,0 +1,62 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+CORRUPTION_GATE_REVISION : i64 = 4;
+
+read32 :: (data: string, at: i64) -> i64 {
+    if at < 0 or at + 4 > data.len { return -1; }
+    data[at].(i64) | (data[at + 1].(i64) << 8) |
+    (data[at + 2].(i64) << 16) | (data[at + 3].(i64) << 24)
+}
+
+record :: (out: *mz.ByteWriter, ok: bool, reader: *mz.ZipReader) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(reader.take_last_error()));
+}
+
+dummy :: (out: *mz.ByteWriter) { out.put_u32le(0); out.put_u32le(0); }
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    maybe := fs.read_file("/tmp/miniz-zip-corruption-fixtures.bin");
+    if maybe == null { out.deinit(); return 1; }
+    fixtures := maybe!;
+    count := read32(fixtures, 0); at := 4; index := 0;
+    if count < CORRUPTION_GATE_REVISION { context.allocator.dealloc_bytes(fixtures.ptr); out.deinit(); return 1; }
+    while index < count {
+        size := read32(fixtures, at); at += 4;
+        if size < 0 or at + size > fixtures.len { context.allocator.dealloc_bytes(fixtures.ptr); out.deinit(); return 1; }
+        data := string.{ ptr = @fixtures.ptr[at], len = size }; at += size;
+        open_error : mz.ZipError = .no_error; opened := true; empty : mz.ZipReader = ---;
+        reader := mz.open_zip_with_error(data, @open_error) catch (e) { opened = false; empty };
+        if opened { record(@out, true, @reader); }
+        else {
+            out.put_u32le(0); out.put_u32le(mz.zip_error_code(open_error));
+            dummy(@out); dummy(@out); dummy(@out); dummy(@out); dummy(@out);
+            index += 1; continue;
+        }
+
+        reader.clear_last_error(); stat_ok := true;
+        ignored_entry := reader.entry(0) catch (e) { stat_ok = false; mz.ZipEntry.{} };
+        record(@out, stat_ok, @reader);
+
+        reader.clear_last_error(); full_ok := true;
+        reader.validate_entry(0, false, false, gpa) catch (e) { full_ok = false; };
+        record(@out, full_ok, @reader);
+
+        reader.clear_last_error(); headers_ok := true;
+        reader.validate_entry(0, true, false, gpa) catch (e) { headers_ok = false; };
+        record(@out, headers_ok, @reader);
+
+        reader.clear_last_error(); buffer : [256]u8 = ---; extract_ok := true;
+        ignored_size := reader.extract_into(0, string.{ ptr = @buffer[0], len = buffer.len }, mz.ZipExtractOptions.{}, gpa) catch (e) { extract_ok = false; 0 };
+        record(@out, extract_ok, @reader);
+        record(@out, reader.end(), @reader);
+        index += 1;
+    }
+    context.allocator.dealloc_bytes(fixtures.ptr);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-corruption.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

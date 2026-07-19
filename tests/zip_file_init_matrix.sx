@@ -1,0 +1,68 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+CONTAINER : [:0]u8 : "/tmp/miniz-zip-file-init-container.bin";
+TINY : [:0]u8 : "/tmp/miniz-zip-file-init-tiny.bin";
+
+record :: (out: *mz.ByteWriter, ok: bool, value: mz.ZipError) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(value));
+}
+
+run :: (out: *mz.ByteWriter, path: [:0]u8, writable: bool, start: i64, size: i64, alloc: Allocator) {
+    open_error : mz.ZipError = .no_error;
+    opened := true; empty : mz.OwnedZipReader = ---;
+    owned := if writable then mz.open_zip_file_writable_with_error(path, @open_error, start, size, alloc) catch (e) { opened = false; empty }
+             else mz.open_zip_file_with_error(path, @open_error, start, size, alloc) catch (e) { opened = false; empty };
+    record(out, opened, open_error);
+    if !opened {
+        out.put_u32le(0); out.put_u32le(0); out.put_u64le(0); out.put_u64le(0); out.put_u32le(0);
+        record(out, false, .no_error);
+        return;
+    }
+    out.put_u32le(1); // MZ_ZIP_MODE_READING
+    out.put_u32le(4); // MZ_ZIP_TYPE_FILE
+    out.put_u64le(owned.reader.size());
+    out.put_u64le(owned.reader.archive_file_start());
+    out.put_u32le(owned.reader.num_files());
+    end_ok := owned.end(); record(out, end_ok, owned.reader.take_last_error());
+}
+
+run_handle :: (out: *mz.ByteWriter, start: i64, size: i64, alloc: Allocator) {
+    maybe_file := fs.open_file(CONTAINER, .read); if maybe_file == null { return; }
+    file := maybe_file!; if file.seek(start, .set) != start { file.close(); return; }
+    open_error : mz.ZipError = .no_error; opened := true; empty : mz.OwnedZipReader = ---;
+    owned := mz.open_zip_handle_with_error(@file, @open_error, size, alloc) catch (e) { opened = false; empty };
+    record(out, opened, open_error);
+    if !opened {
+        out.put_u32le(0); out.put_u32le(0); out.put_u64le(0); out.put_u64le(0); out.put_u32le(0);
+        record(out, false, .no_error); file.close(); return;
+    }
+    out.put_u32le(1); out.put_u32le(5);
+    out.put_u64le(owned.reader.size()); out.put_u64le(owned.reader.archive_file_start());
+    out.put_u32le(owned.reader.num_files());
+    end_ok := owned.end(); record(out, end_ok, owned.reader.take_last_error()); file.close();
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    // Fixture archive size is the container length minus the 5-byte prefix
+    // and 3-byte suffix.
+    maybe_container := fs.open_file(CONTAINER, .read); if maybe_container == null { out.deinit(); return 1; }
+    container := maybe_container!; container_size := container.seek(0, .end);
+    if container_size < 8 or !container.close() { out.deinit(); return 1; }
+    archive_size := container_size - 8;
+    run(@out, CONTAINER, false, 5, archive_size, gpa);
+    run(@out, CONTAINER, true, 5, archive_size, gpa);
+    run(@out, CONTAINER, false, 5, 0, gpa);
+    run(@out, CONTAINER, false, 5, 1, gpa);
+    run(@out, CONTAINER, false, 5, archive_size + 100, gpa);
+    run(@out, CONTAINER, false, archive_size + 100, archive_size, gpa);
+    run(@out, TINY, false, 0, 0, gpa);
+    run(@out, "/tmp/miniz-zip-file-init-missing.bin", false, 0, 0, gpa);
+    run_handle(@out, 5, archive_size, gpa);
+    run_handle(@out, 5, 0, gpa);
+    run_handle(@out, 5, 1, gpa);
+    run_handle(@out, archive_size + 100, archive_size, gpa);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-file-init-matrix.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if wrote and gpa.alloc_count == 0 then 0 else 1
+}

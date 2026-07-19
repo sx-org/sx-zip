@@ -1,0 +1,84 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+roundtrip :: (plain: string, level: i64, alloc: Allocator) -> bool {
+    packed := mz.deflate(plain, level, alloc);
+    got := mz.inflate(packed, plain.len + 1, alloc) catch (e) {
+        alloc.dealloc_bytes(packed.ptr);
+        return false;
+    };
+    ok := mz.bytes_equal(plain, got);
+    alloc.dealloc_bytes(got.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+
+    empty := mz.deflate_stored("", gpa);
+    empty_out := mz.inflate(empty, 0, gpa) catch (e) { gpa.dealloc_bytes(empty.ptr); return 1; };
+    if empty_out.len != 0 { return 1; }
+    if empty_out.ptr != null { gpa.dealloc_bytes(empty_out.ptr); }
+    gpa.dealloc_bytes(empty.ptr);
+
+    raw := gpa.alloc_bytes(70000);
+    data := string.{ ptr = xx raw, len = 70000 };
+    i := 0;
+    while i < data.len {
+        data.ptr[i] = ((i * 17 + i / 251) & 0xff).(u8);
+        i += 1;
+    }
+
+    first := string.{ ptr = data.ptr, len = 65535 };
+    stored_one := mz.deflate_stored(first, gpa);
+    if stored_one.len != 65540 or (stored_one[0] & 1) != 1 {
+        gpa.dealloc_bytes(stored_one.ptr);
+        gpa.dealloc_bytes(raw);
+        return 1;
+    }
+    one_ok := roundtrip(first, 0, gpa);
+    gpa.dealloc_bytes(stored_one.ptr);
+    if !one_ok { gpa.dealloc_bytes(raw); return 1; }
+
+    second := string.{ ptr = data.ptr, len = 65536 };
+    stored_two := mz.deflate_stored(second, gpa);
+    if stored_two.len != 65546 or (stored_two[0] & 1) != 0 or (stored_two[65540] & 1) != 1 {
+        gpa.dealloc_bytes(stored_two.ptr);
+        gpa.dealloc_bytes(raw);
+        return 1;
+    }
+    two_out := mz.inflate(stored_two, 65536, gpa) catch (e) {
+        gpa.dealloc_bytes(stored_two.ptr);
+        gpa.dealloc_bytes(raw);
+        return 1;
+    };
+    if !mz.bytes_equal(two_out, second) { return 1; }
+    gpa.dealloc_bytes(two_out.ptr);
+    gpa.dealloc_bytes(stored_two.ptr);
+
+    // Repetitive data crosses the 32 KiB window repeatedly and drives maximum
+    // length matches plus hash-chain ring reuse.
+    i = 0;
+    while i < data.len { data.ptr[i] = ('A' + (i % 7)).(u8); i += 1; }
+    fixed := mz.deflate(data, 9, gpa);
+    if fixed.len >= 2000 {
+        gpa.dealloc_bytes(fixed.ptr);
+        gpa.dealloc_bytes(raw);
+        return 1;
+    }
+    fixed_out := mz.inflate(fixed, data.len, gpa) catch (e) {
+        gpa.dealloc_bytes(fixed.ptr);
+        gpa.dealloc_bytes(raw);
+        return 1;
+    };
+    ok := mz.bytes_equal(fixed_out, data);
+    gpa.dealloc_bytes(fixed_out.ptr);
+    gpa.dealloc_bytes(fixed.ptr);
+    gpa.dealloc_bytes(raw);
+    if !ok { return 1; }
+
+    if gpa.alloc_count != 0 { print("boundary leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("boundary smoke ok\n");
+    0
+}

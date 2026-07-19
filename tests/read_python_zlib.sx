@@ -1,0 +1,22 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    maybe_packed := fs.read_file("/tmp/python-miniz-interop.zlib");
+    if maybe_packed == null { return 1; }
+    packed := maybe_packed!;
+    plain := mz.decompress(packed, 20000, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(packed.ptr);
+        return 1;
+    };
+    phrase := "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    ok := plain.len == phrase.len * 100;
+    i := 0;
+    while ok and i < plain.len {
+        if plain[i] != phrase[i % phrase.len] { ok = false; }
+        i += 1;
+    }
+    context.allocator.dealloc_bytes(plain.ptr);
+    context.allocator.dealloc_bytes(packed.ptr);
+    if ok then 0 else 1
+}

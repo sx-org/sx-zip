@@ -1,0 +1,25 @@
+// zlib-compatible compression facade. This is the native counterpart of a
+// build with inflate and archive APIs disabled.
+#import "../../miniz.sx";
+
+Flush :: MzFlush;
+Progress :: MzProgress;
+Strategy :: CompressionStrategy;
+Path :: DeflatePath;
+Stream :: MzDeflateStream;
+
+OK :: MZ_OK;
+STREAM_END :: MZ_STREAM_END;
+STREAM_ERROR :: MZ_STREAM_ERROR;
+MEM_ERROR :: MZ_MEM_ERROR;
+BUF_ERROR :: MZ_BUF_ERROR;
+PARAM_ERROR :: MZ_PARAM_ERROR;
+
+version_string :: version;
+status_string :: error_string;
+bound :: compress_bound;
+compress_zlib :: compress;
+compress_zlib_checked :: compress_checked;
+compress_zlib_strategy :: compress_strategy;
+compress_zlib_path :: compress_path;
+compress_zlib_into :: compress_into;

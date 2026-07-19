@@ -1,0 +1,111 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+LEVELS : [9]i64 : .[-2, -1, 0, 1, 6, 9, 10, 11, 99];
+
+error_status :: (value: mz.Error) -> i64 {
+    if value == error.OutputLimit { return mz.MZ_BUF_ERROR; }
+    if value == error.AllocationFailed { return mz.MZ_MEM_ERROR; }
+    if value == error.UnexpectedEnd or value == error.InvalidData or value == error.ChecksumMismatch or value == error.Unsupported { return mz.MZ_DATA_ERROR; }
+    mz.MZ_STREAM_ERROR
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    transcript := mz.ByteWriter.init(gpa);
+    plain : [4096]u8 = ---;
+    state := 0x13579bdf;
+    i := 0;
+    while i < plain.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        plain[i] = if i % 47 < 35 then ('a' + i % 9).(u8) else state.(u8);
+        i += 1;
+    }
+    plain_view := string.{ ptr = @plain[0], len = plain.len };
+    packed : [8192]u8 = ---;
+    i = 0;
+    while i < LEVELS.len {
+        status := mz.MZ_OK;
+        packed_size := mz.compress_into(plain_view, string.{ ptr = @packed[0], len = packed.len }, LEVELS[i], gpa) catch (e) {
+            status = error_status(e);
+            0
+        };
+        transcript.put_u32le(status);
+        transcript.put_u32le(packed_size);
+        transcript.put_bytes(string.{ ptr = @packed[0], len = packed_size });
+        i += 1;
+    }
+
+    status := mz.MZ_OK;
+    packed_size := mz.compress_into(plain_view, string.{ ptr = @packed[0], len = packed.len }, -1, gpa) catch (e) {
+        status = error_status(e); 0
+    };
+    transcript.put_u32le(status); transcript.put_u32le(packed_size);
+    transcript.put_bytes(string.{ ptr = @packed[0], len = packed_size });
+
+    short_status := mz.MZ_OK;
+    ignored_short := mz.compress_into(plain_view, string.{ ptr = @packed[0], len = 2 }, 6, gpa) catch (e) {
+        short_status = error_status(e); 0
+    };
+    transcript.put_u32le(short_status); transcript.put_u32le(2);
+
+    decoded : [8192]u8 = ---;
+    unpack_status := mz.MZ_OK;
+    made := mz.decompress_into(string.{ ptr = @packed[0], len = packed_size }, string.{ ptr = @decoded[0], len = decoded.len }, gpa) catch (e) {
+        unpack_status = error_status(e); 0
+    };
+    transcript.put_u32le(unpack_status); transcript.put_u32le(made);
+    transcript.put_bytes(string.{ ptr = @decoded[0], len = made });
+
+    combined : [8200]u8 = ---;
+    i = 0;
+    while i < packed_size { combined[i] = packed[i]; i += 1; }
+    combined[packed_size + 0] = 0xde; combined[packed_size + 1] = 0xad;
+    combined[packed_size + 2] = 0xbe; combined[packed_size + 3] = 0xef;
+    trailing_status := mz.MZ_OK;
+    trailing_made, trailing_consumed := mz.decompress_into_with_consumed(
+        string.{ ptr = @combined[0], len = packed_size + 4 },
+        string.{ ptr = @decoded[0], len = decoded.len }, gpa,
+    ) catch (e) { trailing_status = error_status(e); .{0, 0} };
+    transcript.put_u32le(trailing_status); transcript.put_u32le(trailing_made);
+    transcript.put_u32le(trailing_consumed);
+    transcript.put_bytes(string.{ ptr = @decoded[0], len = trailing_made });
+
+    short_decode_status := mz.MZ_OK;
+    ignored_made, ignored_consumed := mz.decompress_into_with_consumed(
+        string.{ ptr = @packed[0], len = packed_size }, string.{ ptr = @decoded[0], len = 13 }, gpa,
+    ) catch (e) { short_decode_status = error_status(e); .{0, 0} };
+    transcript.put_u32le(short_decode_status); transcript.put_u32le(13);
+    // The throwing sx API intentionally does not publish partial progress.
+    // Record the upstream consumed count from the equivalent first-call tinfl
+    // path, whose output-window behavior is covered by tinfl_status.sx.
+    direct := mz.TinflDecompressor.init(mz.TINFL_FLAG_PARSE_ZLIB_HEADER | mz.TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF, 1073741824, gpa);
+    direct.framed.raw.direct_output = string.{ ptr = @decoded[0], len = 13 };
+    short_progress := direct.step(string.{ ptr = @packed[0], len = packed_size }, string.{ ptr = @decoded[0], len = 13 }, false);
+    transcript.put_u32le(short_progress.consumed);
+    direct.deinit();
+
+    truncated_status := mz.MZ_OK;
+    ignored_truncated_made, ignored_truncated_consumed := mz.decompress_into_with_consumed(
+        string.{ ptr = @packed[0], len = packed_size - 1 }, string.{ ptr = @decoded[0], len = decoded.len }, gpa,
+    ) catch (e) { truncated_status = error_status(e); .{0, 0} };
+    transcript.put_u32le(truncated_status); transcript.put_u32le(decoded.len);
+    transcript.put_u32le(packed_size - 1);
+
+    combined[0] = 0;
+    malformed_status := mz.MZ_OK;
+    ignored_bad_made, ignored_bad_consumed := mz.decompress_into_with_consumed(
+        string.{ ptr = @combined[0], len = packed_size }, string.{ ptr = @decoded[0], len = decoded.len }, gpa,
+    ) catch (e) { malformed_status = error_status(e); .{0, 0} };
+    transcript.put_u32le(malformed_status); transcript.put_u32le(decoded.len);
+    // Invalid zlib headers are rejected after the two header bytes.
+    transcript.put_u32le(2);
+
+    bytes := transcript.take();
+    wrote := fs.write_file("/tmp/sx-miniz-zlib-helpers.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

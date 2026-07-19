@@ -1,0 +1,138 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+Trace :: struct {
+    data: string;
+    calls: i64;
+    total: i64;
+    max_request: i64;
+    hash: i64;
+}
+
+Sink :: struct {
+    calls: i64;
+    total: i64;
+    max_chunk: i64;
+    hash: i64;
+    checksum: i64;
+    phase: i64;
+}
+
+mix :: (hash: i64, offset: i64, size: i64) -> i64 {
+    record : [16]u8 = ---;
+    i := 0;
+    while i < 8 { record[i] = (offset >> (i * 8)).(u8); record[8 + i] = (size >> (i * 8)).(u8); i += 1; }
+    mz.crc32(string.{ ptr = @record[0], len = record.len }, hash)
+}
+
+source_read :: (ctx: *void, offset: i64, output: string) -> i64 {
+    trace : *Trace = xx ctx;
+    trace.calls += 1; trace.total += output.len;
+    if output.len > trace.max_request { trace.max_request = output.len; }
+    trace.hash = mix(trace.hash, offset, output.len);
+    if offset < 0 or offset >= trace.data.len { return 0; }
+    take := trace.data.len - offset;
+    if take > output.len { take = output.len; }
+    i := 0;
+    while i < take { output.ptr[i] = trace.data[offset + i]; i += 1; }
+    take
+}
+
+sink_write :: (ctx: *void, bytes: string) -> bool {
+    sink : *Sink = xx ctx;
+    offset := sink.total;
+    sink.calls += 1; sink.total += bytes.len;
+    if bytes.len > sink.max_chunk { sink.max_chunk = bytes.len; }
+    sink.hash = mix(sink.hash, offset, bytes.len);
+    sink.checksum = mz.crc32(bytes, sink.checksum);
+    print("chunk {} {} {}\n", sink.phase, offset, bytes.len);
+    true
+}
+
+reset_trace :: (trace: *Trace) { trace.calls = 0; trace.total = 0; trace.max_request = 0; trace.hash = 0; }
+
+print_trace :: (tag: string, trace: *Trace) {
+    print("{}-read {} {} {} {}\n", tag, trace.calls, trace.total, trace.max_request, trace.hash);
+}
+
+print_sink :: (tag: string, sink: *Sink) {
+    print("{}-out {} {} {} {} {}\n", tag, sink.calls, sink.total, sink.max_chunk, sink.hash, sink.checksum);
+}
+
+main :: () -> i32 {
+    maybe_archive := fs.read_file("/tmp/miniz-zip-source-trace.zip");
+    if maybe_archive == null { return 1; }
+    archive := maybe_archive!;
+    defer context.allocator.dealloc_bytes(archive.ptr);
+    trace := Trace.{ data = archive, calls = 0, total = 0, max_request = 0, hash = 0 };
+    source := mz.ZipReadSource.{ ctx = xx @trace, size = archive.len, read = source_read };
+    owned := mz.open_zip_source(source, false) catch (e) { return 1; };
+    print_trace("init", @trace);
+
+    reset_trace(@trace);
+    sink := Sink.{ calls = 0, total = 0, max_chunk = 0, hash = 0, checksum = 0, phase = 1 };
+    output := mz.ZipExtractSink.{ ctx = xx @sink, write = sink_write };
+    stored := mz.zip_extract_name_to_output(@owned.reader, "large-stored.bin", output) catch (e) { owned.deinit(); return 1; };
+    print_trace("stored", @trace); print_sink("stored", @sink);
+
+    reset_trace(@trace);
+    sink = Sink.{ calls = 0, total = 0, max_chunk = 0, hash = 0, checksum = 0, phase = 2 };
+    deflated := mz.zip_extract_name_to_output(@owned.reader, "large-deflated.bin", output) catch (e) { owned.deinit(); return 1; };
+    print_trace("deflate", @trace); print_sink("deflate", @sink);
+
+    reset_trace(@trace);
+    iterator := mz.zip_extract_name_iter(@owned.reader, "large-deflated.bin") catch (e) { owned.deinit(); return 1; };
+    buffer : [997]u8 = ---;
+    iter_total := 0;
+    iter_crc := 0;
+    while true {
+        made := iterator.read(string.{ ptr = @buffer[0], len = buffer.len }) catch (e) { iterator.deinit(); owned.deinit(); return 1; };
+        if made == 0 { break; }
+        iter_total += made;
+        iter_crc = mz.crc32(string.{ ptr = @buffer[0], len = made }, iter_crc);
+    }
+    iterator.deinit();
+    print_trace("iter", @trace);
+    print("iter-out {} {}\n", iter_total, iter_crc);
+
+    reset_trace(@trace);
+    sink = Sink.{ calls = 0, total = 0, max_chunk = 0, hash = 0, checksum = 0, phase = 3 };
+    raw_deflated := mz.zip_extract_name_to_output(
+        @owned.reader, "large-deflated.bin", output,
+        mz.ZipExtractOptions.{ compressed_data = true },
+    ) catch (e) { owned.deinit(); return 1; };
+    print_trace("raw-deflate", @trace); print_sink("raw-deflate", @sink);
+
+    reset_trace(@trace);
+    raw_iterator := mz.zip_extract_name_iter(
+        @owned.reader, "large-deflated.bin", mz.ZipExtractOptions.{ compressed_data = true },
+    ) catch (e) { owned.deinit(); return 1; };
+    iter_total = 0; iter_crc = 0;
+    while true {
+        made := raw_iterator.read(string.{ ptr = @buffer[0], len = buffer.len }) catch (e) { raw_iterator.deinit(); owned.deinit(); return 1; };
+        if made == 0 { break; }
+        iter_total += made;
+        iter_crc = mz.crc32(string.{ ptr = @buffer[0], len = made }, iter_crc);
+    }
+    raw_iterator.deinit();
+    print_trace("raw-iter", @trace);
+    print("raw-iter-out {} {}\n", iter_total, iter_crc);
+
+    fixed_raw := context.allocator.alloc_bytes(1024 * 1024);
+    if fixed_raw == null { owned.deinit(); return 1; }
+    fixed := string.{ ptr = xx fixed_raw, len = 1024 * 1024 };
+    read_buffer : [4096]u8 = ---;
+    deflated_index := owned.reader.find("large-deflated.bin") catch (e) {
+        context.allocator.dealloc_bytes(fixed_raw); owned.deinit(); return 1;
+    };
+    reset_trace(@trace);
+    noalloc_made := owned.reader.extract_into_no_alloc(
+        deflated_index, fixed, mz.ZipExtractOptions.{},
+        string.{ ptr = @read_buffer[0], len = read_buffer.len },
+    ) catch (e) { context.allocator.dealloc_bytes(fixed_raw); owned.deinit(); return 1; };
+    print_trace("noalloc", @trace);
+    print("noalloc-out {}\n", mz.crc32(string.{ ptr = fixed.ptr, len = noalloc_made }));
+    context.allocator.dealloc_bytes(fixed_raw);
+    owned.deinit();
+    0
+}

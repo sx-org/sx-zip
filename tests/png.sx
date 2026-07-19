@@ -1,0 +1,53 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    pixels : [16]u8 = .[0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150];
+    channels := 1;
+    while channels <= 4 {
+        count := 2 * 2 * channels;
+        png := mz.write_png(string.{ ptr = @pixels[0], len = count }, 2, 2, channels, 0, 6, gpa) catch (e) { return 1; };
+        ok := png.len > 57 and png[0] == 0x89 and png[1] == 'P' and png[2] == 'N' and png[3] == 'G';
+        gpa.dealloc_bytes(png.ptr);
+        if !ok { return 1; }
+        channels += 1;
+    }
+
+    too_short : [2]u8 = .[0, 0];
+    short_failed := false;
+    none := mz.write_png(string.{ ptr = @too_short[0], len = 2 }, 2, 2, 3, 0, 6, gpa) catch (e) {
+        if e == error.UnexpectedEnd { short_failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if none.ptr != null { gpa.dealloc_bytes(none.ptr); }
+    if !short_failed { return 1; }
+
+    invalid_channels := false;
+    invalid := mz.write_png("", 1, 1, 0, 0, 6, gpa) catch (e) {
+        if e == error.InvalidData { invalid_channels = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if invalid.ptr != null { gpa.dealloc_bytes(invalid.ptr); }
+    if !invalid_channels { return 1; }
+
+    invalid_stride := false;
+    bad_stride := mz.write_png(string.{ ptr = @pixels[0], len = 16 }, 2, 2, 3, 5, 6, gpa) catch (e) {
+        if e == error.InvalidData { invalid_stride = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if bad_stride.ptr != null { gpa.dealloc_bytes(bad_stride.ptr); }
+    if !invalid_stride { return 1; }
+
+    dimension_overflow := false;
+    huge := mz.write_png("", 0x100000000, 1, 1, 0, 6, gpa) catch (e) {
+        if e == error.TooLarge { dimension_overflow = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if huge.ptr != null { gpa.dealloc_bytes(huge.ptr); }
+    if !dimension_overflow { return 1; }
+
+    if gpa.alloc_count != 0 { print("png leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("png smoke ok\n");
+    0
+}

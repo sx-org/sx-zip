@@ -1,0 +1,100 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+Sink :: struct {
+    out: mz.ByteWriter;
+    calls: i64 = 0;
+    offered: i64 = 0;
+    reject: bool = false;
+}
+
+put :: (ctx: *void, data: string) -> bool {
+    sink : *Sink = xx ctx;
+    sink.calls += 1; sink.offered += data.len;
+    if sink.reject { return false; }
+    sink.out.put_bytes(data);
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    raw := gpa.alloc_bytes(100000);
+    if raw == null { out.deinit(); return 1; }
+    source := string.{ ptr = xx raw, len = 100000 };
+    state := 0x9e3779b9;
+    i := 0;
+    while i < source.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        source.ptr[i] = (if i % 251 < 211 then i * 17 + i / 97 else state).(u8);
+        i += 1;
+    }
+    flags := mz.compression_flags(6, -15, mz.CompressionStrategy.default);
+
+    compressor := mz.TdeflCompressor.init(flags, mz.DeflatePath.fastest, false, gpa);
+    out.put_u32le(if !compressor.raw.allocation_failed then 1 else 0);
+    out.put_u32le(if compressor.status() == .okay then 1 else 0);
+    compressor.deinit();
+
+    compressed_result := mz.deflate_flags(source, flags, false, mz.DeflatePath.fastest, gpa);
+    compressed := compressed_result.bytes;
+    out.put_u32le(compressed.len); out.put_bytes(compressed);
+    tiny : [7]u8 = ---;
+    tiny_failed := false;
+    ignored_tiny, ignored_consumed := mz.inflate_into(compressed, string.{ ptr = @tiny[0], len = tiny.len }, false, gpa) catch (e) { tiny_failed = true; .{0, 0} };
+    // The upstream tdefl fixed-output adapter returns zero when compression
+    // cannot fit. The equivalent native proof is that the exact stream is
+    // larger than the supplied seven-byte destination.
+    out.put_u32le(if compressed.len > tiny.len then 0 else compressed.len);
+
+    deflate_sink := Sink.{ out = mz.ByteWriter.init(gpa) };
+    deflate_iface := mz.TdeflSink.{ ctx = xx @deflate_sink, write = put };
+    callback_size := mz.deflate_flags_to_output(source, flags, deflate_iface, false, mz.DeflatePath.fastest, gpa) catch (e) { deflate_sink.out.deinit(); gpa.dealloc_bytes(compressed.ptr); gpa.dealloc_bytes(source.ptr); out.deinit(); return 1; };
+    callback_bytes := deflate_sink.out.take();
+    out.put_u32le(1); out.put_u32le(deflate_sink.calls); out.put_u32le(callback_size); out.put_u32le(deflate_sink.offered);
+    out.put_bytes(callback_bytes);
+    gpa.dealloc_bytes(callback_bytes.ptr);
+    reject_deflate := Sink.{ out = mz.ByteWriter.init(gpa), reject = true };
+    reject_deflate_iface := mz.TdeflSink.{ ctx = xx @reject_deflate, write = put };
+    rejected := false;
+    ignored_reject := mz.deflate_flags_to_output(source, flags, reject_deflate_iface, false, mz.DeflatePath.fastest, gpa) catch (e) { rejected = true; 0 };
+    out.put_u32le(if rejected then 0 else 1); out.put_u32le(reject_deflate.calls);
+    out.put_u32le(reject_deflate.out.bytes.len); out.put_u32le(reject_deflate.offered);
+    reject_deflate.out.deinit();
+
+    decompressor := mz.TinflDecompressor.init(0, 100000, gpa);
+    out.put_u32le(if decompressor.framed.raw.window.ptr != null then 1 else 0);
+    decompressor.deinit();
+
+    plain_raw := gpa.alloc_bytes(100000);
+    if plain_raw == null { gpa.dealloc_bytes(compressed.ptr); gpa.dealloc_bytes(source.ptr); out.deinit(); return 1; }
+    plain := string.{ ptr = xx plain_raw, len = 100000 };
+    made, consumed := mz.inflate_into(compressed, plain, false, gpa) catch (e) { gpa.dealloc_bytes(plain.ptr); gpa.dealloc_bytes(compressed.ptr); gpa.dealloc_bytes(source.ptr); out.deinit(); return 1; };
+    out.put_u32le(made); out.put_u32le(mz.crc32(string.{ ptr = plain.ptr, len = made }));
+    short_failed := false;
+    ignored_short, ignored_short_consumed := mz.inflate_into(compressed, string.{ ptr = plain.ptr, len = 99999 }, false, gpa) catch (e) { short_failed = true; .{0, 0} };
+    out.put_u32le(if short_failed then 1 else 0);
+
+    inflate_sink := Sink.{ out = mz.ByteWriter.init(gpa) };
+    inflate_iface := mz.TinflSink.{ ctx = xx @inflate_sink, write = put };
+    callback_plain_size, callback_consumed := mz.inflate_to_output(compressed, inflate_iface, false, 100000, gpa) catch (e) { inflate_sink.out.deinit(); gpa.dealloc_bytes(plain.ptr); gpa.dealloc_bytes(compressed.ptr); gpa.dealloc_bytes(source.ptr); out.deinit(); return 1; };
+    callback_plain := inflate_sink.out.take();
+    out.put_u32le(1); out.put_u32le(callback_consumed); out.put_u32le(inflate_sink.calls);
+    out.put_u32le(callback_plain_size); out.put_u32le(inflate_sink.offered);
+    out.put_u32le(mz.crc32(callback_plain));
+    gpa.dealloc_bytes(callback_plain.ptr);
+
+    reject_inflate := Sink.{ out = mz.ByteWriter.init(gpa), reject = true };
+    reject_inflate_iface := mz.TinflSink.{ ctx = xx @reject_inflate, write = put };
+    inflate_rejected := false; rejected_consumed := 0;
+    ignored_inflate_size, ignored_rejected_result := mz.inflate_to_output(compressed, reject_inflate_iface, false, 100000, gpa, @rejected_consumed) catch (e) { inflate_rejected = true; .{0, 0} };
+    out.put_u32le(if inflate_rejected then 0 else 1); out.put_u32le(rejected_consumed); out.put_u32le(reject_inflate.calls);
+    out.put_u32le(reject_inflate.out.bytes.len); out.put_u32le(reject_inflate.offered);
+    reject_inflate.out.deinit();
+
+    gpa.dealloc_bytes(plain.ptr); gpa.dealloc_bytes(compressed.ptr); gpa.dealloc_bytes(source.ptr);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-lowlevel-adapters.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

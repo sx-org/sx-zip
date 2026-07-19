@@ -1,0 +1,7 @@
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    if mz.adler32("Wikipedia") != 0x11e60398 { return 1; }
+    if mz.crc32("123456789") != 0xcbf43926 { return 1; }
+    0
+}

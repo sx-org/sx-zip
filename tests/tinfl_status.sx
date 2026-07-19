@@ -1,0 +1,169 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SinkState :: struct { out: mz.ByteWriter; fail: bool; }
+
+sink_write :: (ctx: *void, bytes: string) -> bool {
+    state : *SinkState = xx ctx;
+    if state.fail { return false; }
+    state.out.put_bytes(bytes);
+    true
+}
+
+status_code :: (status: mz.TinflStatus) -> i64 {
+    if status == .cannot_make_progress { return -4; }
+    if status == .bad_param { return -3; }
+    if status == .adler_mismatch { return -2; }
+    if status == .failed { return -1; }
+    if status == .done { return 0; }
+    if status == .needs_more_input { return 1; }
+    2
+}
+
+record_malformed :: (packed: string, out: *mz.ByteWriter, alloc: Allocator) {
+    state := mz.TinflDecompressor.init(mz.TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | mz.TINFL_FLAG_COMPUTE_ADLER32, 64, alloc);
+    output : [64]u8 = ---;
+    progress := state.step(packed, string.{ ptr = @output[0], len = output.len }, false);
+    out.put_u32le(status_code(progress.status));
+    out.put_u32le(progress.consumed);
+    out.put_u32le(progress.produced);
+    out.put_u32le(state.adler());
+    state.deinit();
+}
+
+run_case :: (packed: string, plain: string, flags: i64, expected_status: mz.TinflStatus, out: *mz.ByteWriter, alloc: Allocator) -> bool {
+    state := mz.TinflDecompressor.init(flags, 8192, alloc);
+    output : [8192]u8 = ---;
+    input_at := 0;
+    output_at := 0;
+    calls := 0;
+    final_status : mz.TinflStatus = .failed;
+    while true {
+        input_size := packed.len - input_at;
+        if input_size > 7 { input_size = 7; }
+        output_size := output.len - output_at;
+        if (flags & 4) != 0 and output_size > 13 { output_size = 13; }
+        input : string = .{ ptr = null, len = 0 };
+        if input_size > 0 { input = string.{ ptr = @packed.ptr[input_at], len = input_size }; }
+        destination := string.{ ptr = @output[output_at], len = output_size };
+        more := input_at + input_size < packed.len;
+        progress := state.step(input, destination, more);
+        out.put_u32le(status_code(progress.status));
+        out.put_u32le(progress.consumed);
+        out.put_u32le(progress.produced);
+        input_at += progress.consumed;
+        output_at += progress.produced;
+        final_status = progress.status;
+        calls += 1;
+        if calls > 100000 { state.deinit(); return false; }
+        if progress.status == .done or progress.status == .cannot_make_progress or progress.status == .failed or progress.status == .adler_mismatch or progress.status == .bad_param { break; }
+    }
+    out.put_u32le(0x7fffffff);
+    out.put_u32le(output_at);
+    out.put_u32le(state.adler());
+    out.put_bytes(string.{ ptr = @output[0], len = output_at });
+    ok := final_status == expected_status;
+    if final_status == .done {
+        ok = ok and output_at == plain.len and mz.bytes_equal(string.{ ptr = @output[0], len = output_at }, plain);
+    }
+    state.deinit();
+    ok
+}
+
+test_adapters :: (raw: string, zlib: string, plain: string, alloc: Allocator) -> bool {
+    fixed : [4096]u8 = ---;
+    made, consumed := mz.inflate_into(raw, string.{ ptr = @fixed[0], len = fixed.len }, false, alloc) catch (e) { print("raw into {}\n", e); return false; };
+    if made != plain.len or consumed != raw.len or !mz.bytes_equal(string.{ ptr = @fixed[0], len = made }, plain) { print("raw into mismatch {} {}\n", made, consumed); return false; }
+    zmade, zconsumed := mz.inflate_into(zlib, string.{ ptr = @fixed[0], len = fixed.len }, true, alloc) catch (e) { print("zlib into {}\n", e); return false; };
+    if zmade != plain.len or zconsumed != zlib.len or !mz.bytes_equal(string.{ ptr = @fixed[0], len = zmade }, plain) { print("zlib into mismatch {} {}\n", zmade, zconsumed); return false; }
+    short := false;
+    ignored_made, ignored_consumed := mz.inflate_into(raw, string.{ ptr = @fixed[0], len = 2 }, false, alloc) catch (e) {
+        if e == error.OutputLimit { short = true; }
+        else { print("short error {}\n", e); }
+        .{0, 0}
+    };
+    if !short { print("short missing\n"); return false; }
+
+    state := SinkState.{ out = mz.ByteWriter.init(alloc), fail = false };
+    sink := mz.TinflSink.{ ctx = xx @state, write = sink_write };
+    callback_made, callback_consumed := mz.inflate_to_output(raw, sink, false, 8192, alloc) catch (e) { print("callback {}\n", e); state.out.deinit(); return false; };
+    callback := state.out.take();
+    callback_ok := callback_made == plain.len and callback_consumed == raw.len and mz.bytes_equal(callback, plain);
+    alloc.dealloc_bytes(callback.ptr);
+    if !callback_ok { print("callback mismatch {} {}\n", callback_made, callback_consumed); return false; }
+
+    failing_state := SinkState.{ out = mz.ByteWriter.init(alloc), fail = true };
+    failing_sink := mz.TinflSink.{ ctx = xx @failing_state, write = sink_write };
+    failed := false;
+    ignored_total, ignored_source := mz.inflate_to_output(raw, failing_sink, false, 8192, alloc) catch (e) {
+        if e == error.Io { failed = true; }
+        .{0, 0}
+    };
+    failing_state.out.deinit();
+    if !failed { print("callback failure missing\n"); }
+    failed
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    plain_bytes : [4096]u8 = ---;
+    i := 0;
+    while i < plain_bytes.len {
+        plain_bytes[i] = if i % 29 < 21 then ('a' + i % 5).(u8) else ((i * 73 + 11) & 255).(u8);
+        i += 1;
+    }
+    plain := string.{ ptr = @plain_bytes[0], len = plain_bytes.len };
+    raw_result := mz.deflate_flags(plain, 128, false, .fastest, gpa);
+    zlib_result := mz.deflate_flags(plain, 4224, false, .fastest, gpa);
+    out := mz.ByteWriter.init(gpa);
+    ok := run_case(raw_result.bytes, plain, 4, .done, @out, gpa) and
+          run_case(raw_result.bytes, plain, 12, .done, @out, gpa) and
+          run_case(raw_result.bytes, plain, 0, .done, @out, gpa) and
+          run_case(zlib_result.bytes, plain, 5, .done, @out, gpa);
+    zlib_result.bytes.ptr[zlib_result.bytes.len - 1] = zlib_result.bytes[zlib_result.bytes.len - 1] ^ 1;
+    ok = ok and run_case(zlib_result.bytes, plain, 5, .adler_mismatch, @out, gpa);
+    truncated := string.{ ptr = raw_result.bytes.ptr, len = raw_result.bytes.len - 1 };
+    ok = ok and run_case(truncated, plain, 4, .cannot_make_progress, @out, gpa);
+    writer := mz.BitWriter.init(gpa);
+    writer.write(7, 3);
+    malformed := writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(1, 3); writer.write(0, 5); writer.write(1, 16); writer.write(0, 16);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(3, 3); mz.emit_fixed_symbol(@writer, 257); writer.write(0, 5);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(3, 3); mz.emit_fixed_symbol(@writer, 286);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(3, 3); mz.emit_fixed_symbol(@writer, 'A'); mz.emit_fixed_symbol(@writer, 257);
+    writer.write(mz.reverse_bits(30, 5), 5);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(1, 1); writer.write(2, 2); writer.write(0, 5); writer.write(0, 5); writer.write(0, 4);
+    writer.write(1, 3); writer.write(1, 3); writer.write(1, 3); writer.write(1, 3);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    writer = mz.BitWriter.init(gpa);
+    writer.write(1, 3);
+    malformed = writer.finish(); record_malformed(malformed, @out, gpa); gpa.dealloc_bytes(malformed.ptr);
+
+    zlib_result.bytes.ptr[zlib_result.bytes.len - 1] = zlib_result.bytes[zlib_result.bytes.len - 1] ^ 1;
+    ok = ok and test_adapters(raw_result.bytes, zlib_result.bytes, plain, gpa);
+    gpa.dealloc_bytes(raw_result.bytes.ptr);
+    gpa.dealloc_bytes(zlib_result.bytes.ptr);
+    bytes := out.take();
+    wrote := fs.write_file("/tmp/sx-miniz-tinfl-status.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !ok or !wrote or gpa.alloc_count != 0 {
+        print("tinfl final ok={} wrote={} leaks={}\n", ok, wrote, gpa.alloc_count);
+        return 1;
+    }
+    0
+}

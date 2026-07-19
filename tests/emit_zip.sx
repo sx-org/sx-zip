@@ -1,0 +1,22 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+sink_write :: (ctx: *void, data: string) -> bool {
+    writer : *mz.ByteWriter = xx ctx;
+    writer.put_bytes(data);
+    true
+}
+
+main :: () -> i32 {
+    output := mz.ByteWriter.init(context.allocator);
+    sink := mz.ZipSink.{ ctx = xx @output, write = sink_write };
+    writer := mz.ZipStreamWriter.init(sink, context.allocator);
+    writer.add("alpha.txt", "alpha", .store, 0) catch (e) { writer.deinit(); output.deinit(); return 1; };
+    writer.add("nested/repeat.txt", "repeat repeat repeat repeat repeat", .deflate, 6) catch (e) { writer.deinit(); output.deinit(); return 1; };
+    writer.finish() catch (e) { writer.deinit(); output.deinit(); return 1; };
+    writer.deinit();
+    archive := output.take();
+    ok := fs.write_file("/tmp/sx-miniz-interop.zip", archive);
+    context.allocator.dealloc_bytes(archive.ptr);
+    if ok then 0 else 1
+}

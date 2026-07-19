@@ -1,0 +1,18 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+fs :: #import "modules/std/fs.sx";
+
+main :: () -> i32 {
+    writer := mz.ZipWriter.init(context.allocator);
+    options := mz.ZipEntryOptions.{
+        method = .store,
+        level = 0,
+        time_mode = .specified,
+        modified_unix_seconds = 1704164645,
+    };
+    writer.add_options("time.txt", "timestamp payload", options) catch (e) { writer.deinit(); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); return 1; };
+    ok := fs.write_file("/tmp/sx-zip-exact-time.zip", archive);
+    context.allocator.dealloc_bytes(archive.ptr);
+    if ok then 0 else 1
+}

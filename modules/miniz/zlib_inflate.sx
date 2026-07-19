@@ -1,0 +1,23 @@
+// zlib-compatible decompression facade. This is the native counterpart of a
+// build with deflate and archive-writing APIs disabled.
+#import "../../miniz.sx";
+
+Flush :: MzFlush;
+Progress :: MzProgress;
+Stream :: MzInflateStream;
+
+OK :: MZ_OK;
+STREAM_END :: MZ_STREAM_END;
+NEED_DICT :: MZ_NEED_DICT;
+STREAM_ERROR :: MZ_STREAM_ERROR;
+DATA_ERROR :: MZ_DATA_ERROR;
+MEM_ERROR :: MZ_MEM_ERROR;
+BUF_ERROR :: MZ_BUF_ERROR;
+
+version_string :: version;
+status_string :: error_string;
+decompress_zlib :: decompress;
+decompress_zlib_exact :: decompress_exact;
+decompress_zlib_with_consumed :: decompress_with_consumed;
+decompress_zlib_into :: decompress_into;
+decompress_zlib_into_with_consumed :: decompress_into_with_consumed;

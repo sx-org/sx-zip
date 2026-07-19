@@ -1,0 +1,50 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SIZES : [5]i64 : .[0, 1, 258, 32768, 65536];
+LEVELS : [5]i64 : .[0, 1, 6, 9, 9];
+RANDOM_NAMES : [5]string : .[
+    "random-l0-n0.bin", "random-l1-n1.bin", "random-l6-n258.bin",
+    "random-l9-n32768.bin", "random-l9-n65536.bin",
+];
+REPEAT_NAMES : [5]string : .[
+    "repeat-l0-n0.bin", "repeat-l1-n1.bin", "repeat-l6-n258.bin",
+    "repeat-l9-n32768.bin", "repeat-l9-n65536.bin",
+];
+
+main :: () -> i32 {
+    raw := context.allocator.alloc_bytes(65536);
+    data := string.{ ptr = xx raw, len = 65536 };
+    state := 0x12345678;
+    i := 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        data.ptr[i] = (state & 0xff).(u8);
+        i += 1;
+    }
+
+    writer := mz.ZipWriter.init(context.allocator);
+    i = 0;
+    while i < SIZES.len {
+        writer.add(RANDOM_NAMES[i], string.{ ptr = data.ptr, len = SIZES[i] }, if LEVELS[i] == 0 then .store else .deflate, LEVELS[i]) catch (e) {
+            writer.deinit(); context.allocator.dealloc_bytes(raw); return 1;
+        };
+        i += 1;
+    }
+    i = 0;
+    while i < data.len { data.ptr[i] = ('a' + ((i / 97 + i) % 11)).(u8); i += 1; }
+    i = 0;
+    while i < SIZES.len {
+        writer.add(REPEAT_NAMES[i], string.{ ptr = data.ptr, len = SIZES[i] }, if LEVELS[i] == 0 then .store else .deflate, LEVELS[i]) catch (e) {
+            writer.deinit(); context.allocator.dealloc_bytes(raw); return 1;
+        };
+        i += 1;
+    }
+    archive := writer.finish() catch (e) { writer.deinit(); context.allocator.dealloc_bytes(raw); return 1; };
+    ok := fs.write_file("/tmp/sx-miniz-corpus.zip", archive);
+    context.allocator.dealloc_bytes(archive.ptr);
+    context.allocator.dealloc_bytes(raw);
+    if ok then 0 else 1
+}

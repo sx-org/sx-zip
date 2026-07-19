@@ -1,0 +1,21 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    raw := context.allocator.alloc_bytes(5000);
+    data := string.{ ptr = xx raw, len = 5000 };
+    state := 0x31415926;
+    i := 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        data.ptr[i] = ('A' + (state % 10)).(u8);
+        i += 1;
+    }
+    packed := mz.compress(data, 9, context.allocator);
+    ok := fs.write_file("/tmp/sx-miniz-interop.zlib", packed);
+    context.allocator.dealloc_bytes(packed.ptr);
+    context.allocator.dealloc_bytes(raw);
+    if ok then 0 else 1
+}

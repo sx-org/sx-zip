@@ -1,0 +1,10 @@
+#import "modules/std/core.sx";
+raw_deflate :: #import "../modules/miniz/raw_deflate.sx";
+
+main :: () -> i32 {
+    flags := raw_deflate.create_flags(0, -15, raw_deflate.Strategy.default);
+    result := raw_deflate.compress_flags("abc", flags, false, raw_deflate.Path.fastest, context.allocator);
+    ok := result.bytes.len == 8;
+    context.allocator.dealloc_bytes(result.bytes.ptr);
+    if ok then 0 else 2
+}

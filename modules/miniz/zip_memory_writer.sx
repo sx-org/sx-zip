@@ -1,0 +1,21 @@
+// Memory-only ZIP creation facade. Path/handle adapters and timestamp helpers
+// are deliberately not re-exported. Advanced callers can use Writer while
+// keeping the resulting executable filesystem-free; the link gate proves it.
+#import "../../miniz.sx";
+
+Writer :: ZipWriter;
+StreamWriter :: ZipStreamWriter;
+Sink :: ZipSink;
+InputSource :: ZipInputSource;
+Input :: ZipInput;
+EntryOptions :: ZipEntryOptions;
+TimeMode :: ZipTimeMode;
+Method :: ZipMethod;
+ArchiveError :: ZipError;
+Mode :: ZipMode;
+StorageType :: ZipStorageType;
+
+writer_from_reader :: zip_writer_from_reader;
+create_archive :: create_zip;
+create_archive_without_time :: create_zip_without_time;
+append_archive :: append_zip;

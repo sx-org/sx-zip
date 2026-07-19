@@ -1,0 +1,8 @@
+#import "modules/std/core.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    // This must not compile: the native namespace never defines the ambient
+    // stock-zlib alias selected by MINIZ_NO_ZLIB_COMPATIBLE_NAME(S).
+    mz.deflateInit(null, 6)
+}

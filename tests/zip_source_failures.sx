@@ -1,0 +1,80 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+Source :: struct { data: string; calls: i64; short_at: i64; }
+
+source_read :: (ctx: *void, offset: i64, output: string) -> i64 {
+    s : *Source = xx ctx; s.calls += 1;
+    if offset < 0 or offset >= s.data.len { return 0; }
+    take := s.data.len - offset; if take > output.len { take = output.len; }
+    if s.calls == s.short_at and take > 0 { take -= 1; }
+    i := 0; while i < take { output.ptr[i] = s.data[offset + i]; i += 1; }
+    take
+}
+
+reject_write :: (ctx: *void, bytes: string) -> bool { false }
+
+record_error :: (out: *mz.ByteWriter, ok: bool, error_value: mz.ZipError, source: *Source) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(error_value)); out.put_u32le(source.calls);
+}
+
+record_reader :: (out: *mz.ByteWriter, ok: bool, reader: *mz.ZipReader, source: *Source) {
+    record_error(out, ok, reader.take_last_error(), source);
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    maybe_archive := fs.read_file("/tmp/miniz-zip-source-failures.zip");
+    if maybe_archive == null { out.deinit(); return 1; }
+    archive := maybe_archive!;
+    source_state := Source.{ data = archive, calls = 0, short_at = 1 };
+    source := mz.ZipReadSource.{ ctx = xx @source_state, size = archive.len, read = source_read };
+    open_error : mz.ZipError = .no_error; opened := true; empty_owned : mz.OwnedZipReader = ---;
+    failed_owned := mz.open_zip_source_with_error(source, @open_error, false, gpa) catch (e) { opened = false; empty_owned };
+    record_error(@out, opened, open_error, @source_state);
+    if opened { failed_owned.deinit(); }
+
+    source_state.calls = 0; source_state.short_at = 0; open_error = .no_error; opened = true;
+    owned := mz.open_zip_source_with_error(source, @open_error, false, gpa) catch (e) {
+        context.allocator.dealloc_bytes(archive.ptr); out.deinit(); return 1;
+    };
+    record_error(@out, opened, open_error, @source_state);
+    fixed : [256]u8 = ---;
+    source_state.calls = 0; source_state.short_at = 1;
+    extract_ok := true;
+    made := owned.reader.extract_into(0, string.{ ptr = @fixed[0], len = fixed.len }, mz.ZipExtractOptions.{}, gpa) catch (e) { extract_ok = false; 0 };
+    record_reader(@out, extract_ok, @owned.reader, @source_state);
+
+    source_state.calls = 0; source_state.short_at = 0;
+    null_sink := mz.ZipExtractSink.{ ctx = null, write = null };
+    null_callback_ok := true;
+    null_callback_made := mz.zip_extract_to_output(@owned.reader, 0, null_sink, mz.ZipExtractOptions.{}, 1024, gpa) catch (e) { null_callback_ok = false; 0 };
+    record_reader(@out, null_callback_ok, @owned.reader, @source_state);
+
+    source_state.calls = 0; source_state.short_at = 0;
+    sink := mz.ZipExtractSink.{ ctx = null, write = reject_write };
+    callback_ok := true;
+    callback_made := mz.zip_extract_to_output(@owned.reader, 0, sink, mz.ZipExtractOptions.{}, 1024, gpa) catch (e) { callback_ok = false; 0 };
+    record_reader(@out, callback_ok, @owned.reader, @source_state);
+
+    source_state.calls = 0; source_state.short_at = 1;
+    iter_ok := true; empty_iter : mz.ZipExtractIterator = ---;
+    iterator := mz.zip_extract_iter(@owned.reader, 0, mz.ZipExtractOptions.{}, 1024, gpa) catch (e) { iter_ok = false; empty_iter };
+    record_reader(@out, iter_ok, @owned.reader, @source_state);
+    if iter_ok { iterator.deinit(); }
+
+    source_state.calls = 0; source_state.short_at = 0; iter_ok = true;
+    iterator = mz.zip_extract_iter(@owned.reader, 0, mz.ZipExtractOptions.{}, 1024, gpa) catch (e) { iter_ok = false; empty_iter };
+    record_reader(@out, iter_ok, @owned.reader, @source_state);
+    if !iter_ok { owned.deinit(); context.allocator.dealloc_bytes(archive.ptr); out.deinit(); return 1; }
+    source_state.calls = 0; source_state.short_at = 1;
+    iter_read_ok := true;
+    iter_made := iterator.read(string.{ ptr = @fixed[0], len = fixed.len }) catch (e) { iter_read_ok = false; 0 };
+    record_reader(@out, iter_read_ok and iter_made != 0, @owned.reader, @source_state);
+    out.put_u32le(if iterator.free() then 1 else 0);
+    record_reader(@out, owned.reader.end(), @owned.reader, @source_state);
+    owned.deinit(); context.allocator.dealloc_bytes(archive.ptr);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-source-failures.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

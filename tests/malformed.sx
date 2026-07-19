@@ -1,0 +1,102 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+expect_inflate_error :: (data: string, want: mz.Error, alloc: Allocator) -> bool {
+    failed := false;
+    result := mz.inflate(data, 1000, alloc) catch (e) {
+        if e == want { failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if result.ptr != null { alloc.dealloc_bytes(result.ptr); }
+    failed
+}
+
+expect_zlib_error :: (data: string, want: mz.Error, alloc: Allocator) -> bool {
+    failed := false;
+    result := mz.decompress(data, 1000, alloc) catch (e) {
+        if e == want { failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if result.ptr != null { alloc.dealloc_bytes(result.ptr); }
+    failed
+}
+
+expect_gzip_error :: (data: string, want: mz.Error, alloc: Allocator) -> bool {
+    failed := false;
+    result := mz.gzip_decompress(data, 1000, alloc) catch (e) {
+        if e == want { failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if result.ptr != null { alloc.dealloc_bytes(result.ptr); }
+    failed
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+
+    reserved : [1]u8 = .[7];
+    if !expect_inflate_error(string.{ ptr = @reserved[0], len = 1 }, error.InvalidData, gpa) { return 1; }
+
+    bad_stored : [5]u8 = .[1, 1, 0, 0, 0];
+    if !expect_inflate_error(string.{ ptr = @bad_stored[0], len = bad_stored.len }, error.InvalidData, gpa) { return 1; }
+
+    truncated_stored : [5]u8 = .[1, 2, 0, 253, 255];
+    if !expect_inflate_error(string.{ ptr = @truncated_stored[0], len = truncated_stored.len }, error.UnexpectedEnd, gpa) { return 1; }
+
+    truncated_fixed : [1]u8 = .[3];
+    if !expect_inflate_error(string.{ ptr = @truncated_fixed[0], len = 1 }, error.UnexpectedEnd, gpa) { return 1; }
+
+    // A match before any literal has an impossible backwards distance.
+    bits := mz.BitWriter.init(gpa);
+    bits.write(1, 1);
+    bits.write(1, 2);
+    mz.emit_fixed_symbol(@bits, 257);
+    bits.write(mz.reverse_bits(0, 5), 5);
+    mz.emit_fixed_symbol(@bits, 256);
+    impossible := bits.finish();
+    bad_distance := expect_inflate_error(impossible, error.InvalidData, gpa);
+    gpa.dealloc_bytes(impossible.ptr);
+    if !bad_distance { return 1; }
+
+    bad_fcheck : [6]u8 = .[0x78, 0, 0, 0, 0, 0];
+    if !expect_zlib_error(string.{ ptr = @bad_fcheck[0], len = bad_fcheck.len }, error.InvalidData, gpa) { return 1; }
+    dictionary : [6]u8 = .[0x78, 0x20, 0, 0, 0, 0];
+    if !expect_zlib_error(string.{ ptr = @dictionary[0], len = dictionary.len }, error.Unsupported, gpa) { return 1; }
+
+    // Bytes inserted between the final DEFLATE block and Adler trailer are
+    // not part of a valid zlib stream, even when the checksum still matches.
+    packed := mz.compress("strict", 6, gpa);
+    padded_raw := gpa.alloc_bytes(packed.len + 1);
+    padded := string.{ ptr = xx padded_raw, len = packed.len + 1 };
+    i := 0;
+    while i < packed.len - 4 { padded.ptr[i] = packed[i]; i += 1; }
+    padded.ptr[i] = 0; i += 1;
+    while i < padded.len { padded.ptr[i] = packed[i - 1]; i += 1; }
+    trailing_failed := expect_zlib_error(padded, error.ChecksumMismatch, gpa);
+    gpa.dealloc_bytes(padded_raw);
+    gpa.dealloc_bytes(packed.ptr);
+    if !trailing_failed { return 1; }
+
+    reserved_gzip : [10]u8 = .[0x1f, 0x8b, 8, 0xe0, 0, 0, 0, 0, 0, 255];
+    if !expect_gzip_error(string.{ ptr = @reserved_gzip[0], len = reserved_gzip.len }, error.InvalidData, gpa) { return 1; }
+
+    options := mz.GzipOptions.{ filename = "x", header_crc = true };
+    bad_header := mz.gzip_compress_options("x", options, 6, gpa) catch (e) { return 1; };
+    // Fixed header (10), filename + NUL (2), then the two-byte FHCRC.
+    bad_header.ptr[12] = bad_header.ptr[12] ^ 1;
+    bad_hcrc := expect_gzip_error(bad_header, error.ChecksumMismatch, gpa);
+    gpa.dealloc_bytes(bad_header.ptr);
+    if !bad_hcrc { return 1; }
+
+    tiny_zip : [4]u8 = .[0x50, 0x4b, 0x05, 0x06];
+    zip_failed := false;
+    reader := mz.open_zip(string.{ ptr = @tiny_zip[0], len = tiny_zip.len }) catch (e) {
+        if e == error.InvalidData { zip_failed = true; }
+        mz.ZipReader.{ data = "", central_offset = 0, central_size = 0, count = 0, comment = "" }
+    };
+    if !zip_failed { return 1; }
+
+    if gpa.alloc_count != 0 { print("malformed leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("malformed smoke ok\n");
+    0
+}

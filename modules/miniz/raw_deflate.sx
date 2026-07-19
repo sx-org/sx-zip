@@ -1,0 +1,35 @@
+// Low-level DEFLATE/tdefl facade. Importing this module does not re-export
+// zlib, inflate, ZIP, filesystem, or timestamp declarations.
+#import "../../miniz.sx";
+
+Strategy :: CompressionStrategy;
+Path :: DeflatePath;
+Flush :: FlushMode;
+Status :: StreamStatus;
+Progress :: StreamProgress;
+CompressorStatus :: TdeflStatus;
+Sink :: TdeflSink;
+Compressor :: TdeflCompressor;
+Stream :: Deflater;
+StoredStream :: StoredDeflater;
+Result :: TdeflResult;
+
+WRITE_ZLIB_HEADER :: TDEFL_WRITE_ZLIB_HEADER;
+COMPUTE_ADLER32 :: TDEFL_COMPUTE_ADLER32;
+GREEDY_PARSING :: TDEFL_GREEDY_PARSING;
+NONDETERMINISTIC_PARSING :: TDEFL_NONDETERMINISTIC_PARSING;
+RLE_MATCHES :: TDEFL_RLE_MATCHES;
+FILTER_MATCHES :: TDEFL_FILTER_MATCHES;
+FORCE_ALL_STATIC_BLOCKS :: TDEFL_FORCE_ALL_STATIC_BLOCKS;
+FORCE_ALL_RAW_BLOCKS :: TDEFL_FORCE_ALL_RAW_BLOCKS;
+MAX_PROBES_MASK :: TDEFL_MAX_PROBES_MASK;
+
+create_flags :: compression_flags;
+bound :: compress_bound;
+checksum_adler32 :: adler32;
+checksum_crc32 :: crc32;
+compress_raw :: deflate;
+compress_raw_strategy :: deflate_strategy;
+compress_raw_path :: deflate_path;
+compress_flags :: deflate_flags;
+compress_flags_to_output :: deflate_flags_to_output;

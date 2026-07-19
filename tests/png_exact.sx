@@ -1,0 +1,66 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+LEVELS : [4]i64 : .[0, 1, 6, 10];
+
+record_case :: (pixels: string, width: i64, height: i64, channels: i64, level: i64, flip: bool, output: *mz.ByteWriter, alloc: Allocator) {
+    png := mz.write_png_ex(pixels, width, height, channels, level, flip, alloc) catch (e) {
+        output.put_u32le(0); output.put_u32le(0); return;
+    };
+    output.put_u32le(1); output.put_u32le(png.len); output.put_bytes(png);
+    alloc.dealloc_bytes(png.ptr);
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    pixels : [24]u8 = ---;
+    output := mz.ByteWriter.init(gpa);
+    channels := 1;
+    while channels <= 4 {
+        i := 0;
+        count := 3 * 2 * channels;
+        while i < count {
+            pixels[i] = ((i * 37 + channels * 19) & 255).(u8);
+            i += 1;
+        }
+        level_index := 0;
+        while level_index < LEVELS.len {
+            flip := 0;
+            while flip <= 1 {
+                png := mz.write_png_ex(
+                    string.{ ptr = @pixels[0], len = count }, 3, 2, channels,
+                    LEVELS[level_index], flip == 1, gpa,
+                ) catch (e) { output.deinit(); return 1; };
+                output.put_u32le(png.len);
+                output.put_bytes(png);
+                gpa.dealloc_bytes(png.ptr);
+                flip += 1;
+            }
+            level_index += 1;
+        }
+        channels += 1;
+    }
+    pixels_view := string.{ ptr = @pixels[0], len = pixels.len };
+    // Default wrapper: level 6, top-to-bottom rows.
+    png := mz.write_png_ex(pixels_view, 3, 2, 4, 6, false, gpa) catch (e) { output.deinit(); return 1; };
+    output.put_u32le(png.len); output.put_bytes(png); gpa.dealloc_bytes(png.ptr);
+    // The upstream unsigned level is clamped to ten.
+    png = mz.write_png_ex(pixels_view, 3, 2, 4, 11, false, gpa) catch (e) { output.deinit(); return 1; };
+    output.put_u32le(png.len); output.put_bytes(png); gpa.dealloc_bytes(png.ptr);
+    png = mz.write_png_ex(pixels_view, 3, 2, 4, 99, false, gpa) catch (e) { output.deinit(); return 1; };
+    output.put_u32le(png.len); output.put_bytes(png); gpa.dealloc_bytes(png.ptr);
+
+    record_case(pixels_view, 0, 2, 4, 6, false, @output, gpa);
+    record_case(pixels_view, -1, 2, 4, 6, false, @output, gpa);
+    record_case(pixels_view, 65536, 2, 4, 6, false, @output, gpa);
+    record_case(pixels_view, 3, 0, 4, 6, false, @output, gpa);
+    record_case(pixels_view, 3, -1, 4, 6, false, @output, gpa);
+    record_case(pixels_view, 3, 65536, 4, 6, false, @output, gpa);
+    record_case(pixels_view, 3, 2, 0, 6, false, @output, gpa);
+    record_case(pixels_view, 3, 2, 5, 6, false, @output, gpa);
+    bytes := output.take();
+    wrote := fs.write_file("/tmp/sx-miniz-png-exact.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

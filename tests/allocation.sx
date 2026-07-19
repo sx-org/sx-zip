@@ -1,0 +1,264 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+FailingAllocator :: struct {
+    parent: Allocator;
+    fail_at: i64;
+    sequence: i64;
+    failures: i64;
+    live: i64;
+
+    init :: (parent: Allocator, fail_at: i64) -> FailingAllocator {
+        FailingAllocator.{ parent = parent, fail_at = fail_at, sequence = 0, failures = 0, live = 0 }
+    }
+}
+
+impl Allocator for FailingAllocator {
+    alloc_bytes :: (self: *FailingAllocator, size: i64) -> *void {
+        self.sequence += 1;
+        if self.fail_at > 0 and self.sequence == self.fail_at {
+            self.failures += 1;
+            return null;
+        }
+        raw := self.parent.alloc_bytes(size);
+        if raw != null { self.live += 1; }
+        raw
+    }
+
+    dealloc_bytes :: (self: *FailingAllocator, ptr: *void) {
+        if ptr == null { return; }
+        self.live -= 1;
+        self.parent.dealloc_bytes(ptr);
+    }
+}
+
+SourceState :: struct { data: string; }
+
+source_read :: (ctx: *void, offset: i64, output: string) -> i64 {
+    state : *SourceState = xx ctx;
+    if offset < 0 or offset >= state.data.len { return 0; }
+    take := state.data.len - offset;
+    if take > output.len { take = output.len; }
+    i := 0;
+    while i < take { output.ptr[i] = state.data[offset + i]; i += 1; }
+    take
+}
+
+SinkState :: struct { out: mz.ByteWriter; }
+
+sink_write :: (ctx: *void, data: string) -> bool {
+    state : *SinkState = xx ctx;
+    state.out.put_bytes(data);
+    !state.out.failed
+}
+
+sink_write_at :: (ctx: *void, offset: i64, data: string) -> bool {
+    state : *SinkState = xx ctx;
+    if offset < 0 or offset > state.out.bytes.len or data.len > state.out.bytes.len - offset { return false; }
+    i := 0;
+    while i < data.len { state.out.bytes.items.ptr[offset + i] = data[i]; i += 1; }
+    true
+}
+
+make_plain :: (bytes: *[70000]u8) -> string {
+    i := 0;
+    while i < bytes.len {
+        bytes[i] = (if (i % 97) < 70 then 'A' + (i % 7) else (i * 29 + 17) & 0xff).(u8);
+        i += 1;
+    }
+    string.{ ptr = @bytes[0], len = bytes.len }
+}
+
+compress_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    failing := FailingAllocator.init(gpa, fail_at);
+    failed_correctly := false;
+    result := mz.compress_checked("allocation failure compression allocation failure compression", 9, failing) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+        string.{ ptr = null, len = 0 }
+    };
+    if result.ptr != null { failing.dealloc_bytes(result.ptr); }
+    injected_ok := failing.failures == 0 or failed_correctly;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+flags_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    failing := FailingAllocator.init(gpa, fail_at);
+    result := mz.deflate_flags("flag adapter allocation failure flag adapter allocation failure", mz.compression_flags(9), false, .fastest, failing);
+    if result.bytes.ptr != null { failing.dealloc_bytes(result.bytes.ptr); }
+    injected_ok := failing.failures == 0 or result.bytes.ptr == null;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+decompress_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    packed := mz.compress("inflate allocation failure inflate allocation failure", 9, gpa);
+    if packed.ptr == null { return false, 0; }
+    failing := FailingAllocator.init(gpa, fail_at);
+    failed_correctly := false;
+    plain := mz.decompress(packed, 1024, failing) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+        string.{ ptr = null, len = 0 }
+    };
+    success := plain.ptr != null and mz.bytes_equal(plain, "inflate allocation failure inflate allocation failure");
+    if plain.ptr != null { failing.dealloc_bytes(plain.ptr); }
+    gpa.dealloc_bytes(packed.ptr);
+    injected_ok := failing.failures == 0 or failed_correctly or success;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+png_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    failing := FailingAllocator.init(gpa, fail_at);
+    pixels : [64]u8 = ---;
+    i := 0;
+    while i < pixels.len { pixels[i] = (i * 11).(u8); i += 1; }
+    failed_correctly := false;
+    result := mz.write_png(string.{ ptr = @pixels[0], len = pixels.len }, 8, 8, 1, 0, 9, failing) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+        string.{ ptr = null, len = 0 }
+    };
+    if result.ptr != null { failing.dealloc_bytes(result.ptr); }
+    injected_ok := failing.failures == 0 or failed_correctly;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+zip_writer_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    failing := FailingAllocator.init(gpa, fail_at);
+    writer := mz.ZipWriter.init(failing);
+    failed_correctly := false;
+    archive : string = .{ ptr = null, len = 0 };
+    writer.add("stored.txt", "stored payload", .store, 0) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+    };
+    if !failed_correctly {
+        writer.add("deflated.txt", "deflated payload deflated payload deflated payload", .deflate, 9) catch (e) {
+            failed_correctly = e == error.AllocationFailed;
+        };
+    }
+    if !failed_correctly {
+        archive = writer.finish() catch (e) {
+            failed_correctly = e == error.AllocationFailed;
+            string.{ ptr = null, len = 0 }
+        };
+    }
+    if archive.ptr != null { failing.dealloc_bytes(archive.ptr); }
+    writer.deinit();
+    injected_ok := failing.failures == 0 or failed_correctly;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+zip_reader_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    writer := mz.ZipWriter.init(gpa);
+    writer.add("data.txt", "reader allocation payload reader allocation payload", .deflate, 9) catch (e) { return false, 0; };
+    archive := writer.finish() catch (e) { writer.deinit(); return false, 0; };
+    reader := mz.open_zip(archive) catch (e) { gpa.dealloc_bytes(archive.ptr); return false, 0; };
+    failing := FailingAllocator.init(gpa, fail_at);
+    failed_correctly := false;
+    result := reader.extract(0, 1024, failing) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+        string.{ ptr = null, len = 0 }
+    };
+    success := result.ptr != null and mz.bytes_equal(result, "reader allocation payload reader allocation payload");
+    if result.ptr != null { failing.dealloc_bytes(result.ptr); }
+    gpa.dealloc_bytes(archive.ptr);
+    injected_ok := failing.failures == 0 or failed_correctly or success;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+zip_source_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    writer := mz.ZipWriter.init(gpa);
+    writer.add("data.txt", "source allocation payload", .store, 0) catch (e) { return false, 0; };
+    archive := writer.finish() catch (e) { writer.deinit(); return false, 0; };
+    source_state := SourceState.{ data = archive };
+    source := mz.ZipReadSource.{ ctx = xx @source_state, size = archive.len, read = source_read };
+    failing := FailingAllocator.init(gpa, fail_at);
+    failed_correctly := false;
+    owned := mz.open_zip_source(source, false, failing) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+        mz.OwnedZipReader.{ reader = ---, bytes = .{ ptr = null, len = 0 }, alloc = failing }
+    };
+    if owned.bytes.ptr != null { owned.deinit(); }
+    gpa.dealloc_bytes(archive.ptr);
+    injected_ok := failing.failures == 0 or failed_correctly;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+stream_writer_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    sink_state := SinkState.{ out = mz.ByteWriter.init(gpa) };
+    sink := mz.ZipSink.{ ctx = xx @sink_state, write = sink_write, write_at = sink_write_at };
+    failing := FailingAllocator.init(gpa, fail_at);
+    writer := mz.ZipStreamWriter.init(sink, failing);
+    failed_correctly := false;
+    writer.add("data.txt", "stream allocation payload stream allocation payload", .deflate, 9) catch (e) {
+        failed_correctly = e == error.AllocationFailed;
+    };
+    if !failed_correctly {
+        writer.add_options("patched.txt", "patched allocation payload", mz.ZipEntryOptions.{ method = .deflate, level = 9, data_descriptor = false }) catch (e) {
+            failed_correctly = e == error.AllocationFailed;
+        };
+    }
+    if !failed_correctly {
+        writer.finish() catch (e) { failed_correctly = e == error.AllocationFailed; };
+    }
+    writer.deinit();
+    sink_state.out.deinit();
+    injected_ok := failing.failures == 0 or failed_correctly;
+    return injected_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+mz_stream_case :: (fail_at: i64) -> (bool, i64) {
+    gpa := mem.GPA.init();
+    failing := FailingAllocator.init(gpa, fail_at);
+    deflater : mz.MzDeflateStream = ---;
+    status := mz.MzDeflateStream.init2(@deflater, 9, 8, 15, 8, mz.CompressionStrategy.default, failing);
+    if status == mz.MZ_OK { deflater.end(); }
+    deflate_ok := status == mz.MZ_OK or status == mz.MZ_MEM_ERROR;
+    inflater : mz.MzInflateStream = ---;
+    inflate_status := mz.MzInflateStream.init2(@inflater, 15, 1024, failing);
+    if inflate_status == mz.MZ_OK { inflater.end(); }
+    inflate_ok := inflate_status == mz.MZ_OK or inflate_status == mz.MZ_MEM_ERROR;
+    return deflate_ok and inflate_ok and failing.live == 0 and gpa.alloc_count == 0, failing.sequence;
+}
+
+run_sweep :: (kind: i64) -> bool {
+    baseline := if kind == 0 then compress_case(0) else
+        if kind == 1 then flags_case(0) else
+        if kind == 2 then decompress_case(0) else
+        if kind == 3 then png_case(0) else
+        if kind == 4 then zip_writer_case(0) else
+        if kind == 5 then zip_reader_case(0) else
+        if kind == 6 then zip_source_case(0) else
+        if kind == 7 then stream_writer_case(0) else mz_stream_case(0);
+    if !baseline.0 or baseline.1 <= 0 { return false; }
+    print("allocation sweep {} sites {}\n", kind, baseline.1);
+    fail_at := 1;
+    while fail_at <= baseline.1 {
+        result := if kind == 0 then compress_case(fail_at) else
+            if kind == 1 then flags_case(fail_at) else
+            if kind == 2 then decompress_case(fail_at) else
+            if kind == 3 then png_case(fail_at) else
+            if kind == 4 then zip_writer_case(fail_at) else
+            if kind == 5 then zip_reader_case(fail_at) else
+            if kind == 6 then zip_source_case(fail_at) else
+            if kind == 7 then stream_writer_case(fail_at) else mz_stream_case(fail_at);
+        if !result.0 { print("allocation sweep {} failed at {}/{}\n", kind, fail_at, baseline.1); return false; }
+        fail_at += 1;
+    }
+    true
+}
+
+main :: () -> i32 {
+    kind := 0;
+    while kind < 9 {
+        if !run_sweep(kind) { return 1; }
+        kind += 1;
+    }
+    print("allocation failure sweep ok\n");
+    0
+}

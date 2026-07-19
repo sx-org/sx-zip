@@ -1,0 +1,99 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+PATH_ARCHIVE : [:0]u8 : "/tmp/sx-file-lifecycle-path.zip";
+CFILE_ARCHIVE : [:0]u8 : "/tmp/sx-file-lifecycle-cfile.bin";
+
+mode_code :: (v: mz.ZipMode) -> i64 {
+    if v == .reading { return 1; }
+    if v == .writing { return 2; }
+    if v == .finalized { return 3; }
+    0
+}
+
+type_code :: (v: mz.ZipStorageType) -> i64 {
+    if v == .user { return 1; }
+    if v == .memory { return 2; }
+    if v == .heap { return 3; }
+    if v == .file { return 4; }
+    if v == .cfile { return 5; }
+    0
+}
+
+result :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+
+snapshot :: (out: *mz.ByteWriter, writer: *mz.ZipStreamWriter, has_file: bool) {
+    out.put_u32le(mode_code(writer.mode())); out.put_u32le(type_code(writer.storage_type()));
+    out.put_u32le(writer.num_files()); out.put_u64le(writer.size());
+    out.put_u64le(writer.archive_file_start()); out.put_u64le(writer.central_directory_size());
+    out.put_u32le(if writer.is_zip64() then 1 else 0); out.put_u32le(if has_file then 1 else 0);
+}
+
+put_file :: (out: *mz.ByteWriter, path: [:0]u8) -> bool {
+    maybe := fs.read_file(path);
+    if maybe == null { return false; }
+    bytes := maybe!;
+    out.put_u32le(bytes.len); out.put_bytes(bytes);
+    context.allocator.dealloc_bytes(bytes.ptr);
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    payload := "stateful-file-writer-payload";
+    owned := mz.open_zip_writer_file(PATH_ARCHIVE, 17, false, true, gpa) catch (e) { out.deinit(); return 1; };
+    result(@out, true, @owned.writer); snapshot(@out, @owned.writer, owned.file_state != null);
+    ok := true;
+    owned.writer.add_options("entry", payload, mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true }) catch (e) { ok = false; };
+    result(@out, ok, @owned.writer);
+    magic : [4]u8 = ---;
+    made := owned.writer.read_archive_data(17, string.{ ptr = @magic[0], len = magic.len }) catch (e) 0;
+    out.put_u64le(made); out.put_bytes(string.{ ptr = @magic[0], len = magic.len });
+    out.put_u32le(mz.zip_error_code(owned.writer.take_last_error()));
+    ok = true; owned.finish() catch (e) { ok = false; };
+    result(@out, ok, @owned.writer); snapshot(@out, @owned.writer, owned.file_state != null);
+    result(@out, owned.end(), @owned.writer); snapshot(@out, @owned.writer, false);
+    if !put_file(@out, PATH_ARCHIVE) { out.deinit(); return 1; }
+
+    maybe_created := fs.open_file(CFILE_ARCHIVE, .write);
+    if maybe_created == null { out.deinit(); return 1; }
+    created := maybe_created!;
+    if !created.close() { out.deinit(); return 1; }
+    maybe_file := fs.open_file(CFILE_ARCHIVE, .read_write);
+    if maybe_file == null { out.deinit(); return 1; }
+    file := maybe_file!;
+    if file.write("PFX!!") != 5 { file.close(); out.deinit(); return 1; }
+    borrowed := mz.open_zip_writer_handle(@file, false, true, gpa) catch (e) { file.close(); out.deinit(); return 1; };
+    result(@out, true, @borrowed.writer); snapshot(@out, @borrowed.writer, borrowed.get_cfile() != null);
+    compressed_payload := "borrowed-handle-deflate-payload-borrowed-handle-deflate-payload";
+    ok = true;
+    borrowed.writer.add_options("entry", compressed_payload, mz.ZipEntryOptions.{ method = .deflate, level = 6, ascii_filename = true }) catch (e) { ok = false; };
+    result(@out, ok, @borrowed.writer);
+    made = borrowed.writer.read_archive_data(0, string.{ ptr = @magic[0], len = magic.len }) catch (e) 0;
+    out.put_u64le(made); out.put_bytes(string.{ ptr = @magic[0], len = magic.len });
+    out.put_u32le(mz.zip_error_code(borrowed.writer.take_last_error()));
+    ok = true; borrowed.finish() catch (e) { ok = false; };
+    result(@out, ok, @borrowed.writer); snapshot(@out, @borrowed.writer, borrowed.get_cfile() != null);
+    result(@out, borrowed.end(), @borrowed.writer);
+    out.put_u32le(if file.write("END") == 3 then 1 else 0);
+    if !file.close() or !put_file(@out, CFILE_ARCHIVE) { out.deinit(); return 1; }
+
+    close_writer := mz.open_zip_writer_file("/tmp/sx-file-lifecycle-close.zip", 0, false, false, gpa) catch (e) { out.deinit(); return 1; };
+    close_writer.finish() catch (e) { close_writer.deinit(); out.deinit(); return 1; };
+    if !close_writer.file_state.file.close() { close_writer.deinit(); out.deinit(); return 1; }
+    result(@out, close_writer.end(), @close_writer.writer);
+
+    close_reader := mz.open_zip_file(PATH_ARCHIVE, 0, 0, gpa) catch (e) { out.deinit(); return 1; };
+    if !close_reader.file_state.file.close() { close_reader.deinit(); out.deinit(); return 1; }
+    reader_ok := close_reader.end();
+    out.put_u32le(if reader_ok then 1 else 0);
+    out.put_u32le(mz.zip_error_code(close_reader.reader.take_last_error()));
+
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-file-lifecycle.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

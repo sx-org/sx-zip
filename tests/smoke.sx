@@ -1,0 +1,116 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+check_bits :: () -> bool {
+    gpa := mem.GPA.init();
+    writer := mz.BitWriter.init(gpa);
+    n := 0;
+    while n <= 15 {
+        mask := if n == 0 then 0 else (1 << n) - 1;
+        writer.write((0x5a5a ^ (n * 73)) & mask, n);
+        n += 1;
+    }
+    writer.write(5, 3);
+    writer.align();
+    writer.write(0xab, 8);
+    bytes := writer.finish();
+
+    reader := mz.BitReader.{ data = bytes, pos = 0, bits = 0, count = 0 };
+    n = 0;
+    while n <= 15 {
+        mask := if n == 0 then 0 else (1 << n) - 1;
+        got := reader.read(n) catch (e) { gpa.dealloc_bytes(bytes.ptr); return false; };
+        if got != ((0x5a5a ^ (n * 73)) & mask) { gpa.dealloc_bytes(bytes.ptr); return false; }
+        n += 1;
+    }
+    a := reader.read(3) catch (e) { gpa.dealloc_bytes(bytes.ptr); return false; };
+    reader.align();
+    b := reader.read(8) catch (e) { gpa.dealloc_bytes(bytes.ptr); return false; };
+    if a != 5 or b != 0xab { gpa.dealloc_bytes(bytes.ptr); return false; }
+    gpa.dealloc_bytes(bytes.ptr);
+
+    empty := mz.ByteWriter.init(gpa);
+    empty.deinit();
+    empty.deinit();
+
+    short := mz.BitReader.{ data = "", pos = 0, bits = 0, count = 0 };
+    failed := false;
+    ignored := short.read(1) catch (e) {
+        if e == error.UnexpectedEnd { failed = true; }
+        0
+    };
+    failed and gpa.alloc_count == 0
+}
+
+main :: () -> i32 {
+    if mz.version() != "11.3.2" {
+        print("version mismatch\n");
+        return 1;
+    }
+    ok_text, ok_known := mz.error_string(mz.MZ_OK);
+    end_text, end_known := mz.error_string(mz.MZ_STREAM_END);
+    dict_text, dict_known := mz.error_string(mz.MZ_NEED_DICT);
+    errno_text, errno_known := mz.error_string(mz.MZ_ERRNO);
+    stream_text, stream_known := mz.error_string(mz.MZ_STREAM_ERROR);
+    data_text, data_known := mz.error_string(mz.MZ_DATA_ERROR);
+    mem_text, mem_known := mz.error_string(mz.MZ_MEM_ERROR);
+    buf_text, buf_known := mz.error_string(mz.MZ_BUF_ERROR);
+    version_text, version_known := mz.error_string(mz.MZ_VERSION_ERROR);
+    param_text, param_known := mz.error_string(mz.MZ_PARAM_ERROR);
+    unknown_text, unknown_known := mz.error_string(12345);
+    if !ok_known or ok_text != "" or !end_known or end_text != "stream end" or
+       !dict_known or dict_text != "need dictionary" or !errno_known or errno_text != "file error" or
+       !stream_known or stream_text != "stream error" or !data_known or data_text != "data error" or
+       !mem_known or mem_text != "out of memory" or !buf_known or buf_text != "buf error" or
+       !version_known or version_text != "version error" or !param_known or param_text != "parameter error" or
+       unknown_known or unknown_text != "" {
+        print("error string mismatch\n");
+        return 1;
+    }
+    if mz.compression_flags(-1) != 0x5080 or
+       mz.compression_flags(0) != 0x85000 or
+       mz.compression_flags(1) != 0x5001 or
+       mz.compression_flags(6, 15, .filtered) != 0x21080 or
+       mz.compression_flags(6, 15, .huffman_only) != 0x1000 or
+       mz.compression_flags(6, 15, .rle) != 0x11080 or
+       mz.compression_flags(6, 15, .fixed) != 0x41080 or
+       mz.compression_flags(10, -15) != 1500 or
+       mz.compression_flags(11) != 0x15dc {
+        print("compression flags mismatch\n");
+        return 1;
+    }
+    bound0 := mz.compress_bound(0) catch (e) { return 1; };
+    bound1 := mz.compress_bound(1) catch (e) { return 1; };
+    if bound0 != 133 or bound1 != 134 {
+        print("compression bound mismatch {} {}\n", bound0, bound1);
+        return 1;
+    }
+    if mz.adler32("") != 1 or mz.crc32("") != 0 {
+        print("empty checksum mismatch\n");
+        return 1;
+    }
+    if mz.adler32("Wikipedia") != 0x11e60398 {
+        print("adler32 mismatch\n");
+        return 1;
+    }
+    if mz.crc32("123456789") != 0xcbf43926 {
+        print("crc32 mismatch\n");
+        return 1;
+    }
+    a1 := mz.adler32("Wiki");
+    if mz.adler32("pedia", a1) != 0x11e60398 {
+        print("incremental adler32 mismatch\n");
+        return 1;
+    }
+    c1 := mz.crc32("1234");
+    if mz.crc32("56789", c1) != 0xcbf43926 {
+        print("incremental crc32 mismatch\n");
+        return 1;
+    }
+    if !check_bits() {
+        print("bit I/O mismatch\n");
+        return 1;
+    }
+    print("core smoke ok\n");
+    0
+}

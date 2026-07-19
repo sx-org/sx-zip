@@ -1,0 +1,89 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+emit_case :: (first: string, second: string, mode: mz.FlushMode, path: string, alloc: Allocator) -> bool {
+    state := mz.Deflater.init(6, alloc);
+    out := mz.ByteWriter.init(alloc);
+    input_at := 0;
+    turns := 0;
+    while turns < 10000 {
+        out.bytes.ensure_capacity(out.bytes.len + 7, alloc);
+        input : string = .{ ptr = null, len = 0 };
+        if input_at < first.len { input = string.{ ptr = @first.ptr[input_at], len = first.len - input_at }; }
+        output := string.{ ptr = @out.bytes.items.ptr[out.bytes.len], len = 7 };
+        progress := state.step_flush(input, output, mode) catch (e) { state.deinit(); out.deinit(); return false; };
+        input_at += progress.consumed;
+        out.bytes.items.len += progress.produced;
+        if input_at == first.len and progress.status == .need_input and state.flush_mode == .none { break; }
+        turns += 1;
+    }
+    if turns >= 10000 { print("flush first loop path={} input={} phase={} mode={} pending={}/{} marker={} need_marker={}\n", path, input_at, state.phase, state.flush_mode, state.pending_at, state.pending_bits, state.emitting_marker, state.needs_marker); state.deinit(); out.deinit(); return false; }
+
+    input_at = 0;
+    turns = 0;
+    while turns < 10000 {
+        out.bytes.ensure_capacity(out.bytes.len + 7, alloc);
+        input : string = .{ ptr = null, len = 0 };
+        if input_at < second.len { input = string.{ ptr = @second.ptr[input_at], len = second.len - input_at }; }
+        output := string.{ ptr = @out.bytes.items.ptr[out.bytes.len], len = 7 };
+        progress := state.step_flush(input, output, .finish) catch (e) { state.deinit(); out.deinit(); return false; };
+        input_at += progress.consumed;
+        out.bytes.items.len += progress.produced;
+        if progress.status == .done { break; }
+        turns += 1;
+    }
+    if turns >= 10000 { print("flush final loop path={} input={} phase={} pending={}/{}\n", path, input_at, state.phase, state.pending_at, state.pending_bits); state.deinit(); out.deinit(); return false; }
+    packed := out.take();
+    combined_writer := mz.ByteWriter.init(alloc);
+    combined_writer.put_bytes(first);
+    combined_writer.put_bytes(second);
+    combined := combined_writer.take();
+    plain := mz.inflate(packed, combined.len, alloc) catch (e) {
+        alloc.dealloc_bytes(combined.ptr); alloc.dealloc_bytes(packed.ptr); state.deinit(); return false;
+    };
+    ok := mz.bytes_equal(plain, combined) and fs.write_file(path, packed);
+    alloc.dealloc_bytes(plain.ptr);
+    alloc.dealloc_bytes(combined.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    state.deinit();
+    ok
+}
+
+emit_zlib_case :: (first: string, second: string, mode: mz.MzFlush, path: string, alloc: Allocator) -> bool {
+    state : mz.MzDeflateStream = ---;
+    if state.init2(6, 8, -15, 9, .default, alloc) != mz.MZ_OK { return false; }
+    packed : [4096]u8 = ---;
+    first_progress := state.step(first, string.{ ptr = @packed[0], len = packed.len }, mode);
+    if first_progress.status != mz.MZ_OK or first_progress.consumed != first.len {
+        state.end();
+        return false;
+    }
+    second_progress := state.step(
+        second,
+        string.{ ptr = @packed[first_progress.produced], len = packed.len - first_progress.produced },
+        .finish,
+    );
+    total := first_progress.produced + second_progress.produced;
+    ok := second_progress.status == mz.MZ_STREAM_END and second_progress.consumed == second.len and
+          fs.write_file(path, string.{ ptr = @packed[0], len = total });
+    ok = state.end() == mz.MZ_OK and ok;
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    first := "first first first first first: sync boundary";
+    second := "second second second second second: final boundary";
+    if !emit_case(first, second, .sync, "/tmp/sx-miniz-flush-sx-sync.deflate", gpa) or
+       !emit_case(first, second, .full, "/tmp/sx-miniz-flush-sx-full.deflate", gpa) or
+       !emit_zlib_case(first, second, .none, "/tmp/sx-miniz-flush-sx-zlib-none.deflate", gpa) or
+       !emit_zlib_case(first, second, .partial, "/tmp/sx-miniz-flush-sx-zlib-partial.deflate", gpa) or
+       !emit_zlib_case(first, second, .sync, "/tmp/sx-miniz-flush-sx-zlib-sync.deflate", gpa) or
+       !emit_zlib_case(first, second, .full, "/tmp/sx-miniz-flush-sx-zlib-full.deflate", gpa) or
+       gpa.alloc_count != 0 {
+        print("flush corpus failed allocations={}\n", gpa.alloc_count);
+        return 1;
+    }
+    print("flush corpus ok\n");
+    0
+}

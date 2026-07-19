@@ -1,0 +1,76 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+CASE_COUNT : i64 : 14;
+Sink :: struct { out: mz.ByteWriter; }
+sink_write :: (ctx: *void, data: string) -> bool { sink : *Sink = xx ctx; sink.out.put_bytes(data); true }
+read16 :: (data: string, at: i64) -> i64 { data[at].(i64) | (data[at + 1].(i64) << 8) }
+read32 :: (data: string, at: i64) -> i64 {
+    data[at].(i64) | (data[at + 1].(i64) << 8) | (data[at + 2].(i64) << 16) | (data[at + 3].(i64) << 24)
+}
+mutate :: (data: string, which: i64) {
+    central := read32(data, data.len - 22 + 16);
+    if which == 1 { data.ptr[0] ^= 1; }
+    else if which == 2 { data.ptr[8] = 99; data.ptr[9] = 0; }
+    else if which == 3 { data.ptr[30] ^= 0x20; }
+    else if which == 4 { data.ptr[6] |= 8; }
+    else if which == 5 { n := read16(data, 26) + 1; data.ptr[26] = n.(u8); data.ptr[27] = (n >> 8).(u8); }
+    else if which == 6 { n := read16(data, 28) + 1; data.ptr[28] = n.(u8); data.ptr[29] = (n >> 8).(u8); }
+    else if which >= 10 and which <= 12 {
+        descriptor := 30 + read16(data, 26) + read16(data, 28) + read32(data, central + 20);
+        if which == 10 { data.ptr[descriptor + 4] ^= 0x5a; }
+        else if which == 11 { data.ptr[descriptor + 8] ^= 0x33; }
+        else { data.ptr[descriptor] ^= 1; }
+    }
+}
+clone :: (source: string, alloc: Allocator) -> string {
+    raw := alloc.alloc_bytes(source.len); if raw == null { return .{ ptr = null, len = 0 }; }
+    result := string.{ ptr = xx raw, len = source.len };
+    i := 0; while i < source.len { result.ptr[i] = source[i]; i += 1; }
+    result
+}
+result :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipWriter) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+run :: (out: *mz.ByteWriter, fixture: string, which: i64, destination_zip64: bool, alloc: Allocator) -> bool {
+    copy := clone(fixture, alloc); if copy.ptr == null { return false; } mutate(copy, which);
+    reader := mz.open_zip(copy) catch (e) { alloc.dealloc_bytes(copy.ptr); return false; };
+    writer := if destination_zip64 then mz.ZipWriter.init_zip64(alloc) else mz.ZipWriter.init(alloc);
+    add_ok := true; writer.add_from_reader(@reader, if which == 7 then 99 else 0) catch (e) { add_ok = false; };
+    result(out, add_ok, @writer);
+    final_ok := false; archive : string = .{ ptr = null, len = 0 };
+    if add_ok { archive = writer.finish() catch (e) string.{ ptr = null, len = 0 }; final_ok = writer.finished and archive.ptr != null; }
+    result(out, final_ok, @writer); out.put_u32le(archive.len); if archive.len > 0 { out.put_bytes(archive); }
+    if archive.ptr != null { alloc.dealloc_bytes(archive.ptr); }
+    writer.end();
+
+    sink := Sink.{ out = mz.ByteWriter.init(alloc) };
+    stream := if destination_zip64 then mz.ZipStreamWriter.init_zip64(mz.ZipSink.{ ctx = xx @sink, write = sink_write }, alloc)
+              else mz.ZipStreamWriter.init(mz.ZipSink.{ ctx = xx @sink, write = sink_write }, alloc);
+    stream_add_ok := true; stream.add_from_reader(@reader, if which == 7 then 99 else 0) catch (e) { stream_add_ok = false; };
+    out.put_u32le(if stream_add_ok then 1 else 0); out.put_u32le(mz.zip_error_code(stream.take_last_error()));
+    stream_final_ok := false;
+    if stream_add_ok { stream.finish() catch (e) {}; stream_final_ok = stream.finished; }
+    out.put_u32le(if stream_final_ok then 1 else 0); out.put_u32le(mz.zip_error_code(stream.take_last_error()));
+    stream_bytes := sink.out.take(); out.put_u32le(stream_bytes.len); if stream_bytes.len > 0 { out.put_bytes(stream_bytes); }
+    if stream_bytes.ptr != null { alloc.dealloc_bytes(stream_bytes.ptr); }
+    stream.end(); reader.end(); alloc.dealloc_bytes(copy.ptr); true
+}
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    maybe := fs.read_file("/tmp/miniz-zip-add-from-reader-fixtures.bin"); if maybe == null { out.deinit(); return 1; }
+    fixtures := maybe!; at := 0;
+    base_size := read32(fixtures, at); at += 4; base := string.{ ptr = @fixtures.ptr[at], len = base_size }; at += base_size;
+    zip64_size := read32(fixtures, at); at += 4; zip64 := string.{ ptr = @fixtures.ptr[at], len = zip64_size }; at += zip64_size;
+    descriptor_size := read32(fixtures, at); at += 4; descriptor := string.{ ptr = @fixtures.ptr[at], len = descriptor_size };
+    i := 0; while i < CASE_COUNT {
+        ok := if i == 8 then run(@out, zip64, i, false, gpa)
+              else if i >= 9 then run(@out, descriptor, i, i == 13, gpa)
+              else run(@out, base, i, false, gpa);
+        if !ok { context.allocator.dealloc_bytes(fixtures.ptr); out.deinit(); return 1; }
+        i += 1;
+    }
+    context.allocator.dealloc_bytes(fixtures.ptr);
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-add-from-reader-matrix.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if wrote and gpa.alloc_count == 0 then 0 else 1
+}

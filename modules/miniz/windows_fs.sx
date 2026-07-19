@@ -1,0 +1,144 @@
+// Minimal dependency-free Win32 filesystem backend used by the miniz port.
+// Paths are UTF-8 at the SX boundary and converted to UTF-16 exactly as the
+// upstream Windows mz_fopen/mz_stat adapters do.
+#import "modules/std/core.sx";
+
+OpenMode :: enum { read; write; append; read_write; }
+SeekFrom :: enum { set; current; end; }
+
+kernel32 :: #library "kernel32";
+MultiByteToWideChar :: (code_page: u32, flags: u32, input: [*]u8, input_len: i32, output: [*]u16, output_len: i32) -> i32 extern kernel32;
+GetProcessHeap :: () -> *void extern kernel32;
+HeapAlloc :: (heap: *void, flags: u32, bytes: u64) -> *void extern kernel32;
+HeapFree :: (heap: *void, flags: u32, memory: *void) -> i32 extern kernel32;
+CreateFileW :: (name: [*]u16, access: u32, share: u32, security: *void, creation: u32, attributes: u32, template: *void) -> *void extern kernel32;
+CloseHandle :: (handle: *void) -> i32 extern kernel32;
+ReadFile :: (handle: *void, buffer: *void, bytes: u32, made: *u32, overlapped: *void) -> i32 extern kernel32;
+WriteFile :: (handle: *void, buffer: *void, bytes: u32, made: *u32, overlapped: *void) -> i32 extern kernel32;
+SetFilePointerEx :: (handle: *void, distance: i64, position: *i64, method: u32) -> i32 extern kernel32;
+GetFileAttributesW :: (name: [*]u16) -> u32 extern kernel32;
+DeleteFileW :: (name: [*]u16) -> i32 extern kernel32;
+GetFileTime :: (handle: *void, created: *void, accessed: *void, written: *FileTime) -> i32 extern kernel32;
+SetFileTime :: (handle: *void, created: *void, accessed: *void, written: *FileTime) -> i32 extern kernel32;
+
+CP_UTF8 : u32 = 65001;
+GENERIC_READ : u32 = 0x80000000;
+GENERIC_WRITE : u32 = 0x40000000;
+FILE_WRITE_ATTRIBUTES : u32 = 0x00000100;
+FILE_SHARE_ALL : u32 = 7;
+CREATE_ALWAYS : u32 = 2;
+OPEN_EXISTING : u32 = 3;
+OPEN_ALWAYS : u32 = 4;
+FILE_ATTRIBUTE_NORMAL : u32 = 0x80;
+INVALID_ATTRIBUTES : u32 = 0xffffffff;
+
+WidePath :: struct { ptr: [*]u16 = null; heap: *void = null; }
+
+wide_path :: (path: [:0]u8) -> WidePath {
+    if path.ptr == null { return .{}; }
+    count := MultiByteToWideChar(CP_UTF8, 0, path.ptr, -1, null, 0);
+    if count <= 0 { return .{}; }
+    heap := GetProcessHeap(); if heap == null { return .{}; }
+    raw := HeapAlloc(heap, 0, (count.(u64) * 2)); if raw == null { return .{}; }
+    wide : [*]u16 = xx raw;
+    if MultiByteToWideChar(CP_UTF8, 0, path.ptr, -1, wide, count) != count {
+        HeapFree(heap, 0, raw); return .{};
+    }
+    .{ ptr = wide, heap = heap }
+}
+
+wide_free :: (wide: WidePath) { if wide.ptr != null { HeapFree(wide.heap, 0, wide.ptr); } }
+
+FileTime :: struct { low: u32; high: u32; }
+
+File :: struct {
+    // Keep the field name used by the POSIX stdlib so archive adapters remain
+    // target-independent. On Windows it stores the pointer-sized HANDLE bits.
+    fd: i64 = -1;
+
+    handle :: (self: *File) -> *void { xx self.fd }
+    is_valid :: (self: *File) -> bool { self.fd != -1 and self.fd != 0 }
+    close :: (self: *File) -> bool {
+        if !self.is_valid() { return false; }
+        ok := CloseHandle(self.handle()) != 0; self.fd = -1; ok
+    }
+    read :: (self: *File, output: string) -> i64 {
+        if !self.is_valid() or (output.len > 0 and output.ptr == null) { return -1; }
+        take := output.len; if take > 0xffffffff { take = 0xffffffff; }
+        made : u32 = 0;
+        if ReadFile(self.handle(), output.ptr, take.(u32), @made, null) == 0 { return -1; }
+        made.(i64)
+    }
+    write :: (self: *File, data: string) -> i64 {
+        if !self.is_valid() or (data.len > 0 and data.ptr == null) { return -1; }
+        take := data.len; if take > 0xffffffff { take = 0xffffffff; }
+        made : u32 = 0;
+        if WriteFile(self.handle(), data.ptr, take.(u32), @made, null) == 0 { return -1; }
+        made.(i64)
+    }
+    seek :: (self: *File, offset: i64, from: SeekFrom) -> i64 {
+        if !self.is_valid() { return -1; }
+        method : u32 = 0; if from == .current { method = 1; } else if from == .end { method = 2; }
+        position : i64 = 0;
+        if SetFilePointerEx(self.handle(), offset, @position, method) == 0 { return -1; }
+        position
+    }
+}
+
+open_file :: (path: [:0]u8, mode: OpenMode) -> ?File {
+    wide := wide_path(path); if wide.ptr == null { return null; }
+    access := GENERIC_READ; creation := OPEN_EXISTING;
+    if mode == .write { access = GENERIC_WRITE; creation = CREATE_ALWAYS; }
+    else if mode == .append { access = GENERIC_WRITE; creation = OPEN_ALWAYS; }
+    else if mode == .read_write { access = GENERIC_READ | GENERIC_WRITE; creation = OPEN_EXISTING; }
+    handle := CreateFileW(wide.ptr, access, FILE_SHARE_ALL, null, creation, FILE_ATTRIBUTE_NORMAL, null);
+    wide_free(wide);
+    bits : i64 = xx handle;
+    if bits == -1 or bits == 0 { return null; }
+    file := File.{ fd = bits };
+    if mode == .append and file.seek(0, .end) < 0 { file.close(); return null; }
+    file
+}
+
+exists :: (path: [:0]u8) -> bool {
+    wide := wide_path(path); if wide.ptr == null { return false; }
+    attributes := GetFileAttributesW(wide.ptr); wide_free(wide); attributes != INVALID_ATTRIBUTES
+}
+
+delete_file :: (path: [:0]u8) -> bool {
+    wide := wide_path(path); if wide.ptr == null { return false; }
+    ok := DeleteFileW(wide.ptr) != 0; wide_free(wide); ok
+}
+
+write_file :: (path: [:0]u8, data: string) -> bool {
+    maybe := open_file(path, .write); if maybe == null { return false; }
+    file := maybe!; at := 0;
+    while at < data.len {
+        made := file.write(string.{ ptr = @data.ptr[at], len = data.len - at });
+        if made <= 0 { file.close(); return false; }
+        at += made;
+    }
+    file.close()
+}
+
+modified_seconds :: (file: *File) -> (i64, bool) {
+    if file == null or !file.is_valid() { return 0, false; }
+    value : FileTime = ---;
+    if GetFileTime(file.handle(), null, null, @value) == 0 { return 0, false; }
+    ticks := value.low.(u64) | (value.high.(u64) << 32);
+    epoch_ticks : u64 = 116444736000000000;
+    if ticks < epoch_ticks { return 0, false; }
+    return ((ticks - epoch_ticks) / 10000000).(i64), true;
+}
+
+set_modified_seconds :: (path: [:0]u8, seconds: i64) -> bool {
+    if seconds < -11644473600 { return false; }
+    wide := wide_path(path); if wide.ptr == null { return false; }
+    handle := CreateFileW(wide.ptr, FILE_WRITE_ATTRIBUTES, FILE_SHARE_ALL, null, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, null);
+    wide_free(wide); bits : i64 = xx handle;
+    if bits == -1 or bits == 0 { return false; }
+    ticks := (seconds + 11644473600).(u64) * 10000000;
+    value := FileTime.{ low = ticks.(u32), high = (ticks >> 32).(u32) };
+    ok := SetFileTime(handle, null, null, @value) != 0;
+    close_ok := CloseHandle(handle) != 0; ok and close_ok
+}

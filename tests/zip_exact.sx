@@ -1,0 +1,212 @@
+#import "modules/std.sx";
+fs :: #import "modules/std/fs.sx";
+mz :: #import "../miniz.sx";
+
+SinkState :: struct { out: mz.ByteWriter; }
+sink_write :: (ctx: *void, data: string) -> bool {
+    state : *SinkState = xx ctx;
+    state.out.put_bytes(data);
+    true
+}
+
+sink_write_at :: (ctx: *void, offset: i64, data: string) -> bool {
+    state : *SinkState = xx ctx;
+    if offset < 0 or offset > state.out.bytes.len or data.len > state.out.bytes.len - offset { return false; }
+    i := 0;
+    while i < data.len { state.out.bytes.items.ptr[offset + i] = data[i]; i += 1; }
+    true
+}
+
+write_archive :: (path: [:0]u8, writer: *mz.ZipWriter) -> bool {
+    archive := writer.finish() catch (e) { writer.deinit(); return false; };
+    ok := fs.write_file(path, archive);
+    writer.alloc.dealloc_bytes(archive.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    repeated := "miniz exact miniz exact miniz exact miniz exact miniz exact";
+    local_extra : [7]u8 = .[0xfe, 0xca, 3, 0, 'a', 'b', 'c'];
+    central_extra : [6]u8 = .[0xef, 0xbe, 2, 0, 'X', 'Y'];
+    local := string.{ ptr = @local_extra[0], len = local_extra.len };
+    central := string.{ ptr = @central_extra[0], len = central_extra.len };
+    exact := mz.ZipEntryOptions.{ data_descriptor = true, auto_store_small = true };
+
+    descriptor := mz.ZipWriter.init(context.allocator);
+    stored_options := exact;
+    stored_options.method = .store;
+    stored_options.extra = local;
+    stored_options.central_extra = central;
+    stored_options.separate_central_extra = true;
+    stored_options.comment = "stored comment";
+    descriptor.add_options("stored.txt", "stored payload", stored_options) catch (e) { descriptor.deinit(); return 1; };
+    deflated_options := exact;
+    deflated_options.method = .deflate;
+    deflated_options.level = 6;
+    descriptor.add_options("deflated.txt", repeated, deflated_options) catch (e) { descriptor.deinit(); return 1; };
+    directory_options := exact;
+    directory_options.method = .store;
+    descriptor.add_options("empty/", "", directory_options) catch (e) { descriptor.deinit(); return 1; };
+    if !write_archive("/tmp/sx-zip-exact-descriptor.zip", @descriptor) { return 1; }
+
+    patched_state := SinkState.{ out = mz.ByteWriter.init(context.allocator) };
+    patched_sink := mz.ZipSink.{ ctx = xx @patched_state, write = sink_write, write_at = sink_write_at };
+    patched := mz.ZipStreamWriter.init(patched_sink, context.allocator);
+    patched_options := mz.ZipEntryOptions.{
+        method = .deflate, level = 9, extra = local,
+        central_extra = central, separate_central_extra = true,
+        comment = "callback comment", ascii_filename = true,
+        data_descriptor = false,
+    };
+    patched_source_state := mz.ZipMemoryInputState.{ data = repeated };
+    patched_source := mz.ZipInputSource.{ ctx = xx @patched_source_state, size = repeated.len, read = mz.zip_memory_input_read };
+    patched.add_source("callback.txt", patched_source, patched_options) catch (e) { patched.deinit(); patched_state.out.deinit(); return 1; };
+    patched.finish() catch (e) { patched.deinit(); patched_state.out.deinit(); return 1; };
+    patched.deinit();
+    patched_bytes := patched_state.out.take();
+    patched_ok := fs.write_file("/tmp/sx-zip-exact-patched.zip", patched_bytes);
+    context.allocator.dealloc_bytes(patched_bytes.ptr);
+    if !patched_ok { return 1; }
+
+    packed := mz.deflate(repeated, 9, context.allocator);
+    raw := mz.ZipWriter.init(context.allocator);
+    raw_options := mz.ZipEntryOptions.{ method = .deflate, level = 9, comment = "raw comment", data_descriptor = true };
+    raw.add_compressed("raw.txt", packed, repeated.len, mz.crc32(repeated), raw_options) catch (e) {
+        context.allocator.dealloc_bytes(packed.ptr); raw.deinit(); return 1;
+    };
+    context.allocator.dealloc_bytes(packed.ptr);
+    if !write_archive("/tmp/sx-zip-exact-raw.zip", @raw) { return 1; }
+
+    zip64 := mz.ZipWriter.init_zip64(context.allocator);
+    zip64_options := exact;
+    zip64_options.method = .deflate;
+    zip64_options.level = 6;
+    zip64.add_options("zip64.txt", repeated, zip64_options) catch (e) { zip64.deinit(); return 1; };
+    if !write_archive("/tmp/sx-zip-exact-zip64.zip", @zip64) { return 1; }
+
+    auto_state := SinkState.{ out = mz.ByteWriter.init(context.allocator) };
+    auto_sink := mz.ZipSink.{ ctx = xx @auto_state, write = sink_write };
+    automatic := mz.ZipStreamWriter.init(auto_sink, context.allocator);
+    automatic.offset = 0xffffffff.(i64);
+    automatic.add_options("large-offset.txt", "payload", mz.ZipEntryOptions.{ method = .store }) catch (e) { automatic.deinit(); auto_state.out.deinit(); return 1; };
+    automatic.finish() catch (e) { automatic.deinit(); auto_state.out.deinit(); return 1; };
+    automatic.deinit();
+    automatic_bytes := auto_state.out.take();
+    automatic_ok := fs.write_file("/tmp/sx-zip-exact-auto.zip", automatic_bytes);
+    context.allocator.dealloc_bytes(automatic_bytes.ptr);
+    if !automatic_ok { return 1; }
+
+    count_writer := mz.ZipWriter.init(context.allocator);
+    count_options := mz.ZipEntryOptions.{ method = .store, data_descriptor = true, auto_store_small = true };
+    count := 0;
+    while count <= 65535 {
+        count_writer.add_options("e", "", count_options) catch (e) { count_writer.deinit(); return 1; };
+        count += 1;
+    }
+    if !write_archive("/tmp/sx-zip-exact-count.zip", @count_writer) { return 1; }
+
+    hint_state := mz.ZipMemoryInputState.{ data = repeated };
+    hint_source := mz.ZipInputSource.{ ctx = xx @hint_state, size = 0x100000000, read = mz.zip_memory_input_read };
+    hint_sink_state := SinkState.{ out = mz.ByteWriter.init(context.allocator) };
+    hint_sink := mz.ZipSink.{ ctx = xx @hint_sink_state, write = sink_write };
+    hint_writer := mz.ZipStreamWriter.init(hint_sink, context.allocator);
+    hint_writer.add_source("large-hint.txt", hint_source, mz.ZipEntryOptions.{ method = .deflate, level = 6 }) catch (e) {
+        hint_writer.deinit(); hint_sink_state.out.deinit(); return 1;
+    };
+    hint_writer.finish() catch (e) { hint_writer.deinit(); hint_sink_state.out.deinit(); return 1; };
+    hint_writer.deinit();
+    hint_bytes := hint_sink_state.out.take();
+    hint_reader := mz.open_zip(hint_bytes) catch (e) {
+        context.allocator.dealloc_bytes(hint_bytes.ptr); return 1;
+    };
+    hint_plain := hint_reader.extract_name("large-hint.txt", 4096, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(hint_bytes.ptr); return 1;
+    };
+    if !mz.bytes_equal(hint_plain, repeated) {
+        context.allocator.dealloc_bytes(hint_plain.ptr);
+        context.allocator.dealloc_bytes(hint_bytes.ptr);
+        return 1;
+    }
+    context.allocator.dealloc_bytes(hint_plain.ptr);
+    hint_ok := fs.write_file("/tmp/sx-zip-exact-size.zip", hint_bytes);
+    context.allocator.dealloc_bytes(hint_bytes.ptr);
+    if !hint_ok { return 1; }
+
+    align_state := SinkState.{ out = mz.ByteWriter.init(context.allocator) };
+    align_sink := mz.ZipSink.{ ctx = xx @align_state, write = sink_write };
+    aligned := mz.ZipStreamWriter.init(align_sink, context.allocator);
+    aligned.offset = 3;
+    aligned.set_alignment(8) catch (e) { aligned.deinit(); align_state.out.deinit(); return 1; };
+    aligned_options := mz.ZipEntryOptions.{ method = .store, data_descriptor = true, auto_store_small = true };
+    aligned.add_options("aligned.txt", "aligned payload", aligned_options) catch (e) { aligned.deinit(); align_state.out.deinit(); return 1; };
+    aligned.finish() catch (e) { aligned.deinit(); align_state.out.deinit(); return 1; };
+    aligned.deinit();
+    aligned_bytes := align_state.out.take();
+    aligned_ok := fs.write_file("/tmp/sx-zip-exact-align.zip", aligned_bytes);
+    context.allocator.dealloc_bytes(aligned_bytes.ptr);
+    if !aligned_ok { return 1; }
+
+    duplicate_writer := mz.ZipWriter.init(context.allocator);
+    duplicate_options := mz.ZipEntryOptions.{ method = .store, data_descriptor = true, auto_store_small = true };
+    duplicate_i := 0;
+    while duplicate_i < 3 {
+        duplicate_writer.add_options("duplicate", "", duplicate_options) catch (e) { duplicate_writer.deinit(); return 1; };
+        duplicate_i += 1;
+    }
+    duplicate_archive := duplicate_writer.finish() catch (e) { duplicate_writer.deinit(); return 1; };
+    duplicate_reader := mz.open_zip(duplicate_archive) catch (e) { context.allocator.dealloc_bytes(duplicate_archive.ptr); return 1; };
+    sorted_index := duplicate_reader.find("duplicate") catch (e) { context.allocator.dealloc_bytes(duplicate_archive.ptr); return 1; };
+    duplicate_reader.set_sorted_lookup(false);
+    linear_index := duplicate_reader.find("duplicate") catch (e) { context.allocator.dealloc_bytes(duplicate_archive.ptr); return 1; };
+    locate_output := mz.ByteWriter.init(context.allocator);
+    locate_output.put_u32le(sorted_index); locate_output.put_u32le(linear_index);
+    locate_bytes := locate_output.take();
+    locate_ok := fs.write_file("/tmp/sx-zip-exact-locate.bin", locate_bytes);
+    context.allocator.dealloc_bytes(locate_bytes.ptr);
+    context.allocator.dealloc_bytes(duplicate_archive.ptr);
+    if !locate_ok { return 1; }
+
+    update_options := mz.ZipEntryOptions.{ method = .deflate, level = 6, data_descriptor = true, auto_store_small = true };
+    base_writer := mz.ZipWriter.init(context.allocator);
+    base_writer.add_options("base.txt", repeated, update_options) catch (e) { base_writer.deinit(); return 1; };
+    base_archive := base_writer.finish() catch (e) { base_writer.deinit(); return 1; };
+    base_reader := mz.open_zip(base_archive) catch (e) { context.allocator.dealloc_bytes(base_archive.ptr); return 1; };
+    update_writer := mz.zip_writer_from_reader(@base_reader, false, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(base_archive.ptr); return 1;
+    };
+    existing := base_reader.extract_name("base.txt", 4096, context.allocator) catch (e) {
+        update_writer.deinit(); context.allocator.dealloc_bytes(base_archive.ptr); return 1;
+    };
+    if !mz.bytes_equal(existing, repeated) {
+        context.allocator.dealloc_bytes(existing.ptr); update_writer.deinit();
+        context.allocator.dealloc_bytes(base_archive.ptr); return 1;
+    }
+    context.allocator.dealloc_bytes(existing.ptr);
+    update_writer.add_options("added.txt", "new payload", update_options) catch (e) {
+        update_writer.deinit(); context.allocator.dealloc_bytes(base_archive.ptr); return 1;
+    };
+    updated_archive := update_writer.finish() catch (e) {
+        update_writer.deinit(); context.allocator.dealloc_bytes(base_archive.ptr); return 1;
+    };
+    updated_ok := fs.write_file("/tmp/sx-zip-exact-update.zip", updated_archive);
+    context.allocator.dealloc_bytes(updated_archive.ptr);
+    context.allocator.dealloc_bytes(base_archive.ptr);
+    if !updated_ok { return 1; }
+
+    huge_payload : [3]u8 = .[1, 2, 3];
+    huge_writer := mz.ZipWriter.init(context.allocator);
+    huge_options := mz.ZipEntryOptions.{ method = .deflate, level = 6, data_descriptor = true };
+    huge_writer.add_compressed(
+        "huge.bin", string.{ ptr = @huge_payload[0], len = huge_payload.len },
+        0x100000001, 0x12345678, huge_options,
+    ) catch (e) { huge_writer.deinit(); return 1; };
+    if !write_archive("/tmp/sx-zip-exact-precompressed64.zip", @huge_writer) { return 1; }
+
+    max_writer := mz.ZipWriter.init(context.allocator);
+    max_writer.add_compressed(
+        "max.bin", string.{ ptr = @huge_payload[0], len = huge_payload.len },
+        0xffffffff, 0x12345678, huge_options,
+    ) catch (e) { max_writer.deinit(); return 1; };
+    if !write_archive("/tmp/sx-zip-exact-precompressed32max.zip", @max_writer) { return 1; }
+    0
+}

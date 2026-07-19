@@ -1,0 +1,23 @@
+// Low-level INFLATE/tinfl facade. Importing this module does not re-export
+// zlib helpers, deflate, ZIP, filesystem, or timestamp declarations.
+#import "../../miniz.sx";
+
+Status :: StreamStatus;
+Progress :: StreamProgress;
+DecoderStatus :: TinflStatus;
+DecoderProgress :: TinflProgress;
+Sink :: TinflSink;
+Decoder :: TinflDecompressor;
+Stream :: Inflater;
+
+PARSE_ZLIB_HEADER :: TINFL_FLAG_PARSE_ZLIB_HEADER;
+HAS_MORE_INPUT :: TINFL_FLAG_HAS_MORE_INPUT;
+USING_NON_WRAPPING_OUTPUT_BUF :: TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
+COMPUTE_ADLER32 :: TINFL_FLAG_COMPUTE_ADLER32;
+
+checksum_adler32 :: adler32;
+checksum_crc32 :: crc32;
+inflate_raw :: inflate;
+inflate_raw_with_consumed :: inflate_with_consumed;
+inflate_fixed :: inflate_into;
+inflate_callback :: inflate_to_output;

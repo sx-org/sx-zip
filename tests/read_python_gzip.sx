@@ -1,0 +1,16 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    maybe_packed := fs.read_file("/tmp/python-miniz-interop.gz");
+    if maybe_packed == null { return 1; }
+    packed := maybe_packed!;
+    plain := mz.gzip_decompress(packed, 1000, context.allocator) catch (e) {
+        context.allocator.dealloc_bytes(packed.ptr);
+        return 1;
+    };
+    ok := mz.bytes_equal(plain, "python gzip member one + member two");
+    context.allocator.dealloc_bytes(plain.ptr);
+    context.allocator.dealloc_bytes(packed.ptr);
+    if ok then 0 else 1
+}

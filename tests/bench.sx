@@ -1,0 +1,81 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+BENCH_WARMUPS : i64 = 3;
+BENCH_SAMPLES : i64 = 15;
+
+mono_ns :: () -> i64 {
+    ts : time.Timespec = .{};
+    c.clock_gettime(time.CLOCK_MONOTONIC, @ts);
+    ts.sec * 1000000000 + ts.nsec
+}
+
+run_case :: (label: string, data: string, level: i64, alloc: Allocator) -> bool {
+    warmup := 0;
+    while warmup < BENCH_WARMUPS {
+        value := mz.compress(data, level, alloc);
+        if value.ptr == null { return false; }
+        alloc.dealloc_bytes(value.ptr);
+        warmup += 1;
+    }
+
+    encode_samples : [15]i64 = ---;
+    run := 0;
+    while run < BENCH_SAMPLES {
+        started := mono_ns();
+        value := mz.compress(data, level, alloc);
+        encode_samples[run] = mono_ns() - started;
+        if value.ptr == null { return false; }
+        alloc.dealloc_bytes(value.ptr);
+        run += 1;
+    }
+    i := 1;
+    while i < BENCH_SAMPLES {
+        value := encode_samples[i];
+        j := i;
+        while j > 0 and encode_samples[j - 1] > value {
+            encode_samples[j] = encode_samples[j - 1];
+            j -= 1;
+        }
+        encode_samples[j] = value;
+        i += 1;
+    }
+    encode_ns := encode_samples[BENCH_SAMPLES / 2];
+
+    packed := mz.compress(data, level, alloc);
+    if packed.ptr == null { return false; }
+    safe_encode_ns := if encode_ns > 0 then encode_ns else 1;
+    ratio_permille := if data.len > 0 then packed.len * 1000 / data.len else 0;
+    encode_kib_s := data.len * 1000000000 / 1024 / safe_encode_ns;
+    print("{} level={} input={} packed={} ratio_permille={} encode_ns={} encode_KiB_s={}\n",
+        label, level, data.len, packed.len, ratio_permille, encode_ns, encode_kib_s);
+    path := if label[0] == 'r' then
+        (if level == 1 then "/tmp/sx-miniz-bench-sx-repeat-1.zlib" else if level == 6 then "/tmp/sx-miniz-bench-sx-repeat-6.zlib" else "/tmp/sx-miniz-bench-sx-repeat-9.zlib")
+    else
+        (if level == 1 then "/tmp/sx-miniz-bench-sx-random-1.zlib" else if level == 6 then "/tmp/sx-miniz-bench-sx-random-6.zlib" else "/tmp/sx-miniz-bench-sx-random-9.zlib");
+    ok := fs.write_file(path, packed);
+    alloc.dealloc_bytes(packed.ptr);
+    ok
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    raw := gpa.alloc_bytes(1048576);
+    data := string.{ ptr = xx raw, len = 1048576 };
+    i := 0;
+    while i < data.len { data.ptr[i] = ('a' + ((i / 97 + i) % 11)).(u8); i += 1; }
+    if !run_case("repetitive", data, 1, gpa) or !run_case("repetitive", data, 6, gpa) or !run_case("repetitive", data, 9, gpa) { return 1; }
+    state := 0x12345678;
+    i = 0;
+    while i < data.len {
+        state = (state ^ (state << 13)) & 0xffffffff;
+        state = state ^ (state >> 17);
+        state = (state ^ (state << 5)) & 0xffffffff;
+        data.ptr[i] = (state & 0xff).(u8);
+        i += 1;
+    }
+    if !run_case("incompressible", data, 1, gpa) or !run_case("incompressible", data, 6, gpa) or !run_case("incompressible", data, 9, gpa) { return 1; }
+    gpa.dealloc_bytes(raw);
+    if gpa.alloc_count != 0 { return 1; }
+    0
+}

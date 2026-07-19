@@ -1,0 +1,95 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+Sink :: struct { out: mz.ByteWriter; }
+sink_write :: (ctx: *void, data: string) -> bool {
+    sink : *Sink = xx ctx;
+    sink.out.put_bytes(data);
+    true
+}
+
+record :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipWriter) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+record_stream :: (out: *mz.ByteWriter, ok: bool, writer: *mz.ZipStreamWriter) {
+    out.put_u32le(if ok then 1 else 0); out.put_u32le(mz.zip_error_code(writer.take_last_error()));
+}
+add_case :: (out: *mz.ByteWriter, name: string, data: string, level: i64) {
+    writer := mz.ZipWriter.init(context.allocator); ok := true;
+    writer.add_options(name, data, mz.ZipEntryOptions.{ method = .store, level = level, ascii_filename = true }) catch (e) { ok = false; };
+    record(out, ok, @writer); writer.end();
+}
+extra_case :: (out: *mz.ByteWriter, local: string, central: string, separate: bool) {
+    writer := mz.ZipWriter.init(context.allocator); ok := true;
+    writer.add_options("x", "", mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true,
+        extra = local, central_extra = central, separate_central_extra = separate }) catch (e) { ok = false; };
+    record(out, ok, @writer);
+    if ok {
+        finish_ok := true; archive := writer.finish() catch (e) { finish_ok = false; string.{ ptr = null, len = 0 } };
+        record(out, finish_ok, @writer); out.put_u32le(archive.len);
+        if archive.ptr != null { context.allocator.dealloc_bytes(archive.ptr); }
+    }
+    writer.end();
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init(); out := mz.ByteWriter.init(gpa);
+    null_stream := mz.ZipStreamWriter.init(mz.ZipSink.{ ctx = null, write = null }, gpa);
+    record_stream(@out, null_stream.mode() != .invalid, @null_stream);
+    null_stream.end();
+
+    inactive := mz.ZipWriter.init(context.allocator); inactive.end();
+    inactive_ok := true; inactive.add_options("x", "", .{ method = .store, level = 0 }) catch (e) { inactive_ok = false; };
+    record(@out, inactive_ok, @inactive);
+
+    alignment := mz.ZipWriter.init(context.allocator); alignment_ok := true;
+    alignment.set_alignment(3) catch (e) { alignment_ok = false; }; record(@out, alignment_ok, @alignment); alignment.end();
+
+    add_case(@out, "/absolute", "", 0);
+    add_case(@out, "dir/", "x", 0);
+    add_case(@out, "level", "payload", 11);
+    long_name : [65536]u8 = ---; i := 0; while i < long_name.len { long_name[i] = 'n'; i += 1; }
+    add_case(@out, string.{ ptr = @long_name[0], len = long_name.len }, "", 0);
+    large : [65536]u8 = ---; i = 0; while i < large.len { large[i] = 0; i += 1; }
+    extra_case(@out, string.{ ptr = @large[0], len = 65535 }, "", true);
+    extra_case(@out, string.{ ptr = @large[0], len = 65536 }, "", true);
+    extra_case(@out, "", string.{ ptr = @large[0], len = 65536 }, true);
+
+    not_raw := mz.ZipWriter.init(context.allocator); not_raw_ok := true;
+    not_raw.add_compressed("not-raw", "x", 1, 0, .{ method = .store }) catch (e) { not_raw_ok = false; };
+    // The C rejection is specifically a contradictory uncompressed-size hint
+    // on non-precompressed input; the native precompressed entry point rejects
+    // the equivalent request to label that payload as stored data.
+    record(@out, not_raw_ok, @not_raw); not_raw.end();
+
+    final := mz.ZipWriter.init(context.allocator); final.add_options("x", "", .{ method = .store, level = 0, ascii_filename = true }) catch (e) { return 2; };
+    finish_ok := true; archive := final.finish() catch (e) { finish_ok = false; string.{ ptr = null, len = 0 } };
+    record(@out, finish_ok, @final); if archive.ptr != null { context.allocator.dealloc_bytes(archive.ptr); }
+    late_ok := true; final.add_options("late", "", .{ method = .store, level = 0 }) catch (e) { late_ok = false; }; record(@out, late_ok, @final);
+    again_ok := true; final.finalize() catch (e) { again_ok = false; }; record(@out, again_ok, @final);
+    record(@out, final.end(), @final); record(@out, final.end(), @final);
+
+    null_source_sink := Sink.{ out = mz.ByteWriter.init(gpa) };
+    null_source_stream := mz.ZipStreamWriter.init(mz.ZipSink.{ ctx = xx @null_source_sink, write = sink_write }, gpa);
+    null_source := mz.ZipInputSource.{ ctx = null, size = 0, read = null };
+    null_source_ok := true;
+    null_source_stream.add_source("empty", null_source, .{ method = .store, level = 0, ascii_filename = true }) catch (e) { null_source_ok = false; };
+    record_stream(@out, null_source_ok, @null_source_stream);
+    null_source_stream.end(); null_source_sink.out.deinit();
+
+    sink_state := Sink.{ out = mz.ByteWriter.init(gpa) };
+    stream := mz.ZipStreamWriter.init(mz.ZipSink.{ ctx = xx @sink_state, write = sink_write }, gpa);
+    source_state := mz.ZipMemoryInputState.{ data = "" };
+    source := mz.ZipInputSource.{ ctx = xx @source_state, size = 0, read = mz.zip_memory_input_read };
+    stream_options := mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true,
+        extra = string.{ ptr = @large[0], len = 65536 }, separate_central_extra = true };
+    stream_add_ok := true; stream.add_source("x", source, stream_options) catch (e) { stream_add_ok = false; };
+    out.put_u32le(if stream_add_ok then 1 else 0); out.put_u32le(mz.zip_error_code(stream.take_last_error()));
+    stream_finish_ok := true; stream.finish() catch (e) { stream_finish_ok = false; };
+    out.put_u32le(if stream_finish_ok then 1 else 0); out.put_u32le(mz.zip_error_code(stream.take_last_error()));
+    out.put_u32le(sink_state.out.bytes.len);
+    stream.end(); sink_state.out.deinit();
+
+    bytes := out.take(); wrote := fs.write_file("/tmp/sx-zip-writer-parameters.bin", bytes); gpa.dealloc_bytes(bytes.ptr);
+    if wrote and gpa.alloc_count == 0 then 0 else 1
+}

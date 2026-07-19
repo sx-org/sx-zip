@@ -1,0 +1,205 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+STORED : [32]u8 : .[1, 27, 0, 228, 255, 115, 116, 111, 114, 101, 100, 32, 98, 108, 111, 99, 107, 32, 99, 114, 111, 115, 115, 105, 110, 103, 32, 98, 121, 116, 101, 115];
+FIXED : [12]u8 : .[75, 203, 172, 72, 77, 81, 72, 195, 71, 42, 2, 0];
+ZLIB_FIXED : [18]u8 : .[120, 156, 75, 203, 172, 72, 77, 81, 72, 195, 71, 42, 2, 0, 247, 117, 13, 34];
+DYNAMIC : [154]u8 : .[
+    237, 205, 219, 9, 195, 48, 16, 5, 209, 86, 110, 1, 193, 149, 248, 47,
+    21, 40, 210, 98, 22, 244, 176, 173, 85, 255, 49, 164, 137, 124, 76, 1,
+    51, 103, 31, 183, 53, 249, 57, 87, 83, 25, 117, 220, 154, 30, 74, 205,
+    226, 165, 60, 250, 180, 28, 22, 235, 86, 42, 126, 250, 204, 222, 15, 89,
+    245, 216, 244, 182, 242, 4, 50, 95, 179, 141, 162, 176, 118, 62, 177, 247,
+    236, 197, 203, 234, 161, 21, 170, 233, 243, 236, 101, 241, 91, 155, 90, 58,
+    122, 82, 170, 126, 173, 180, 105, 199, 198, 198, 198, 198, 198, 198, 198,
+    198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198,
+    198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198, 198,
+    198, 198, 198, 198, 198, 198, 198, 198, 198, 254, 75, 251, 11,
+];
+
+inflate_equals :: (packed: string, plain: string, alloc: Allocator) -> bool {
+    got := mz.inflate(packed, 100000, alloc) catch (e) {
+        print("inflate failed: {}\n", e);
+        return false;
+    };
+    defer alloc.dealloc_bytes(got.ptr);
+    mz.bytes_equal(got, plain)
+}
+
+test_dynamic :: (alloc: Allocator) -> bool {
+    packed := string.{ ptr = @DYNAMIC[0], len = DYNAMIC.len };
+    got := mz.inflate(packed, 20000, alloc) catch (e) {
+        print("dynamic inflate failed: {}\n", e);
+        return false;
+    };
+    phrase := "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+    if got.len != phrase.len * 100 { alloc.dealloc_bytes(got.ptr); return false; }
+    i := 0;
+    while i < got.len {
+        if got[i] != phrase[i % phrase.len] { alloc.dealloc_bytes(got.ptr); return false; }
+        i += 1;
+    }
+    alloc.dealloc_bytes(got.ptr);
+    true
+}
+
+test_zlib :: (alloc: Allocator) -> bool {
+    packed := string.{ ptr = @ZLIB_FIXED[0], len = ZLIB_FIXED.len };
+    got := mz.decompress(packed, 1000, alloc) catch (e) {
+        print("zlib inflate failed: {}\n", e);
+        return false;
+    };
+    if !mz.bytes_equal(got, "fixed fixed fixed fixed fixed fixed!") {
+        alloc.dealloc_bytes(got.ptr);
+        return false;
+    }
+    alloc.dealloc_bytes(got.ptr);
+
+    bad := ZLIB_FIXED;
+    bad[bad.len - 1] = bad[bad.len - 1] ^ 1;
+    failed := false;
+    ignored := mz.decompress(string.{ ptr = @bad[0], len = bad.len }, 1000, alloc) catch (e) {
+        if e == error.ChecksumMismatch { failed = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if ignored.ptr != null { alloc.dealloc_bytes(ignored.ptr); }
+    failed
+}
+
+test_zlib_consumed :: (alloc: Allocator) -> bool {
+    plain := "zlib stream followed by caller-owned bytes";
+    packed := mz.compress(plain, 6, alloc);
+
+    combined_raw := alloc.alloc_bytes(packed.len + 4);
+    combined := string.{ ptr = xx combined_raw, len = packed.len + 4 };
+    i := 0;
+    while i < packed.len { combined[i] = packed[i]; i += 1; }
+    combined[packed.len + 0] = 0xde;
+    combined[packed.len + 1] = 0xad;
+    combined[packed.len + 2] = 0xbe;
+    combined[packed.len + 3] = 0xef;
+
+    got, consumed := mz.decompress_with_consumed(combined, 1000, alloc) catch (e) {
+        print("zlib consumed inflate failed: {}\n", e);
+        return false;
+    };
+    ok := consumed == packed.len and mz.bytes_equal(got, plain);
+    alloc.dealloc_bytes(got.ptr);
+    if !ok { return false; }
+
+    ordinary := mz.decompress(combined, 1000, alloc) catch (e) {
+        return false;
+    };
+    ordinary_ok := mz.bytes_equal(ordinary, plain);
+    alloc.dealloc_bytes(ordinary.ptr);
+
+    rejected := false;
+    ignored := mz.decompress_exact(combined, 1000, alloc) catch (e) {
+        if e == error.InvalidData { rejected = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if ignored.ptr != null { alloc.dealloc_bytes(ignored.ptr); }
+    alloc.dealloc_bytes(combined.ptr);
+    alloc.dealloc_bytes(packed.ptr);
+    ordinary_ok and rejected
+}
+
+test_own_output :: (alloc: Allocator) -> bool {
+    plain := "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
+    raw := mz.deflate(plain, 6, alloc);
+    if raw.len >= plain.len { alloc.dealloc_bytes(raw.ptr); return false; }
+    unpacked := mz.inflate(raw, 1000, alloc) catch (e) {
+        print("own raw inflate failed: {}\n", e);
+        alloc.dealloc_bytes(raw.ptr);
+        return false;
+    };
+    raw_ok := mz.bytes_equal(unpacked, plain);
+    alloc.dealloc_bytes(raw.ptr);
+    alloc.dealloc_bytes(unpacked.ptr);
+    if !raw_ok { print("own raw mismatch packed={} plain={}\n", raw.len, plain.len); return false; }
+
+    framed := mz.compress(plain, 6, alloc);
+    round := mz.decompress(framed, 1000, alloc) catch (e) {
+        print("own zlib inflate failed: {}\n", e);
+        alloc.dealloc_bytes(framed.ptr);
+        return false;
+    };
+    ok := mz.bytes_equal(round, plain);
+    if !ok { print("own zlib mismatch packed={} round={} plain={}\n", framed.len, round.len, plain.len); }
+    alloc.dealloc_bytes(framed.ptr);
+    alloc.dealloc_bytes(round.ptr);
+    ok
+}
+
+test_limits :: (alloc: Allocator) -> bool {
+    packed := string.{ ptr = @FIXED[0], len = FIXED.len };
+    limited := false;
+    ignored := mz.inflate(packed, 5, alloc) catch (e) {
+        if e == error.OutputLimit { limited = true; }
+        string.{ ptr = null, len = 0 }
+    };
+    if ignored.ptr != null { alloc.dealloc_bytes(ignored.ptr); }
+    limited
+}
+
+test_fixed_helpers :: (alloc: Allocator) -> bool {
+    plain := "fixed destination fixed destination fixed destination";
+    expected := mz.compress(plain, 6, alloc);
+    compressed : [256]u8 = ---;
+    compressed_out := string.{ ptr = @compressed[0], len = compressed.len };
+    packed_len := mz.compress_into(plain, compressed_out, 6, alloc) catch (e) {
+        print("compress_into failed: {}\n", e);
+        return false;
+    };
+    if packed_len != expected.len or !mz.bytes_equal(string.{ ptr = @compressed[0], len = packed_len }, expected) { return false; }
+
+    packed_with_tail : [260]u8 = ---;
+    i := 0;
+    while i < packed_len { packed_with_tail[i] = compressed[i]; i += 1; }
+    packed_with_tail[packed_len] = 0xaa;
+    packed_with_tail[packed_len + 1] = 0xbb;
+    decoded : [128]u8 = ---;
+    made, consumed := mz.decompress_into_with_consumed(
+        string.{ ptr = @packed_with_tail[0], len = packed_len + 2 },
+        string.{ ptr = @decoded[0], len = decoded.len }, alloc,
+    ) catch (e) {
+        print("decompress_into failed: {}\n", e);
+        return false;
+    };
+    if made != plain.len or consumed != packed_len or !mz.bytes_equal(string.{ ptr = @decoded[0], len = made }, plain) { return false; }
+
+    compress_short := false;
+    ignored_compress := mz.compress_into(plain, string.{ ptr = @compressed[0], len = 2 }, 6, alloc) catch (e) {
+        if e == error.OutputLimit { compress_short = true; }
+        0
+    };
+    decode_short := false;
+    ignored_decode := mz.decompress_into(expected, string.{ ptr = @decoded[0], len = 2 }, alloc) catch (e) {
+        if e == error.OutputLimit { decode_short = true; }
+        0
+    };
+    clamped := mz.compress_checked(plain, 11, alloc) catch (e) { return false; };
+    level10 := mz.compress(plain, 10, alloc);
+    level_clamps := mz.bytes_equal(clamped, level10);
+    alloc.dealloc_bytes(clamped.ptr);
+    alloc.dealloc_bytes(level10.ptr);
+    alloc.dealloc_bytes(expected.ptr);
+    compress_short and decode_short and level_clamps
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    stored := string.{ ptr = @STORED[0], len = STORED.len };
+    fixed := string.{ ptr = @FIXED[0], len = FIXED.len };
+    if !inflate_equals(stored, "stored block crossing bytes", gpa) { print("stored: FAIL\n"); return 1; }
+    if !inflate_equals(fixed, "fixed fixed fixed fixed fixed fixed!", gpa) { print("fixed: FAIL\n"); return 1; }
+    if !test_dynamic(gpa) { print("dynamic: FAIL\n"); return 1; }
+    if !test_zlib(gpa) { print("zlib: FAIL\n"); return 1; }
+    if !test_zlib_consumed(gpa) { print("zlib consumed: FAIL\n"); return 1; }
+    if !test_own_output(gpa) { print("roundtrip: FAIL\n"); return 1; }
+    if !test_limits(gpa) { print("limit: FAIL\n"); return 1; }
+    if !test_fixed_helpers(gpa) { print("fixed helpers: FAIL\n"); return 1; }
+    if gpa.alloc_count != 0 { print("leaked allocations: {}\n", gpa.alloc_count); return 1; }
+    print("codec smoke ok\n");
+    0
+}

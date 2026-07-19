@@ -1,0 +1,63 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SOURCE : [:0]u8 : "/tmp/sx-miniz-file-source.bin";
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    transcript := mz.ByteWriter.init(gpa);
+
+    file_writer := mz.ZipWriter.init(gpa);
+    file_writer.add_file_default("file.txt", SOURCE) catch (e) { file_writer.deinit(); transcript.deinit(); return 1; };
+    file_archive := file_writer.finish() catch (e) { file_writer.deinit(); transcript.deinit(); return 1; };
+    transcript.put_u32le(file_archive.len);
+    transcript.put_bytes(file_archive);
+    file_reader := mz.open_zip(file_archive) catch (e) { gpa.dealloc_bytes(file_archive.ptr); transcript.deinit(); return 1; };
+    extracted_path : [:0]u8 : "/tmp/sx-file-adapter-extracted.bin";
+    ignored_size := mz.zip_extract_to_file(@file_reader, 0, extracted_path, .{}, 1024, gpa) catch (e) {
+        gpa.dealloc_bytes(file_archive.ptr); transcript.deinit(); return 1;
+    };
+    maybe_extracted := fs.open_file(extracted_path, .read);
+    if maybe_extracted == null { gpa.dealloc_bytes(file_archive.ptr); transcript.deinit(); return 1; }
+    extracted := maybe_extracted!;
+    modified, valid_modified := mz.zip_file_modified_seconds(@extracted);
+    if !extracted.close() or !valid_modified { gpa.dealloc_bytes(file_archive.ptr); transcript.deinit(); return 1; }
+    transcript.put_u32le(modified);
+    fs.delete_file(extracted_path);
+    gpa.dealloc_bytes(file_archive.ptr);
+
+    maybe_file := fs.open_file(SOURCE, .read);
+    if maybe_file == null { transcript.deinit(); return 1; }
+    file := maybe_file!;
+    if file.seek(5, .set) != 5 { file.close(); transcript.deinit(); return 1; }
+    handle_writer := mz.ZipWriter.init(gpa);
+    options := mz.ZipEntryOptions.{ method = .store, level = 0, ascii_filename = true };
+    handle_writer.add_handle("whole-from-zero.bin", @file, 36, options) catch (e) {
+        handle_writer.deinit(); file.close(); transcript.deinit(); return 1;
+    };
+    if !file.close() { handle_writer.deinit(); transcript.deinit(); return 1; }
+    handle_archive := handle_writer.finish() catch (e) { handle_writer.deinit(); transcript.deinit(); return 1; };
+    transcript.put_u32le(handle_archive.len);
+    transcript.put_bytes(handle_archive);
+    gpa.dealloc_bytes(handle_archive.ptr);
+
+    maybe_zero_file := fs.open_file(SOURCE, .read);
+    if maybe_zero_file == null { transcript.deinit(); return 1; }
+    zero_file := maybe_zero_file!;
+    if zero_file.seek(5, .set) != 5 { zero_file.close(); transcript.deinit(); return 1; }
+    zero_writer := mz.ZipWriter.init(gpa);
+    zero_writer.add_handle("zero-max.bin", @zero_file, 0, options) catch (e) {
+        zero_writer.deinit(); zero_file.close(); transcript.deinit(); return 1;
+    };
+    if !zero_file.close() { zero_writer.deinit(); transcript.deinit(); return 1; }
+    zero_archive := zero_writer.finish() catch (e) { zero_writer.deinit(); transcript.deinit(); return 1; };
+    transcript.put_u32le(zero_archive.len);
+    transcript.put_bytes(zero_archive);
+    gpa.dealloc_bytes(zero_archive.ptr);
+
+    bytes := transcript.take();
+    wrote := fs.write_file("/tmp/sx-miniz-file-adapter.bin", bytes);
+    gpa.dealloc_bytes(bytes.ptr);
+    if !wrote or gpa.alloc_count != 0 { return 1; }
+    0
+}

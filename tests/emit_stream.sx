@@ -1,0 +1,30 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+main :: () -> i32 {
+    plain_raw := context.allocator.alloc_bytes(70000);
+    plain := string.{ ptr = xx plain_raw, len = 70000 };
+    i := 0;
+    while i < plain.len { plain.ptr[i] = ('A' + (i % 7)).(u8); i += 1; }
+    packed_raw := context.allocator.alloc_bytes(plain.len * 2 + 1024);
+    packed_storage := string.{ ptr = xx packed_raw, len = plain.len * 2 + 1024 };
+    state := mz.Deflater.init(9, context.allocator);
+    input_at := 0;
+    output_at := 0;
+    done := false;
+    while !done {
+        input : string = .{ ptr = null, len = 0 };
+        if input_at < plain.len { input = string.{ ptr = @plain.ptr[input_at], len = plain.len - input_at }; }
+        output := string.{ ptr = @packed_storage.ptr[output_at], len = packed_storage.len - output_at };
+        progress := state.step(input, output, true) catch (e) { state.deinit(); context.allocator.dealloc_bytes(packed_raw); context.allocator.dealloc_bytes(plain_raw); return 1; };
+        input_at += progress.consumed;
+        output_at += progress.produced;
+        if progress.status == .done { done = true; }
+        else if progress.status == .need_output and output_at == packed_storage.len { state.deinit(); context.allocator.dealloc_bytes(packed_raw); context.allocator.dealloc_bytes(plain_raw); return 1; }
+    }
+    state.deinit();
+    ok := fs.write_file("/tmp/sx-miniz-stream.deflate", string.{ ptr = packed_storage.ptr, len = output_at });
+    context.allocator.dealloc_bytes(packed_raw);
+    context.allocator.dealloc_bytes(plain_raw);
+    if ok then 0 else 1
+}

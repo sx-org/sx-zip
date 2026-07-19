@@ -1,0 +1,115 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+SourceState :: struct {
+    data: string;
+    calls: i64;
+    bytes_read: i64;
+    max_request: i64;
+}
+
+source_read :: (ctx: *void, offset: i64, output: string) -> i64 {
+    state : *SourceState = xx ctx;
+    state.calls += 1;
+    state.bytes_read += output.len;
+    if output.len > state.max_request { state.max_request = output.len; }
+    if offset < 0 or offset > state.data.len { return 0; }
+    take := state.data.len - offset;
+    if take > output.len { take = output.len; }
+    i := 0;
+    while i < take { output.ptr[i] = state.data[offset + i]; i += 1; }
+    take
+}
+
+SinkState :: struct { total: i64; checksum: i64; }
+
+sink_write :: (ctx: *void, bytes: string) -> bool {
+    state : *SinkState = xx ctx;
+    state.total += bytes.len;
+    state.checksum = mz.crc32(bytes, state.checksum);
+    true
+}
+
+main :: () -> i32 {
+    gpa := mem.GPA.init();
+    raw := gpa.alloc_bytes(1024 * 1024);
+    if raw == null { return 1; }
+    payload := string.{ ptr = xx raw, len = 1024 * 1024 };
+    random := 0x31415926;
+    i := 0;
+    while i < payload.len {
+        random = (random ^ (random << 13)) & 0xffffffff;
+        random = random ^ (random >> 17);
+        random = (random ^ (random << 5)) & 0xffffffff;
+        payload.ptr[i] = if i % 97 < 80 then ('A' + i % 7).(u8) else random.(u8);
+        i += 1;
+    }
+
+    writer := mz.ZipWriter.init(gpa);
+    writer.add("large-stored.bin", payload, .store, 0) catch (e) { gpa.dealloc_bytes(raw); return 1; };
+    writer.add("large-deflated.bin", payload, .deflate, 9) catch (e) { writer.deinit(); gpa.dealloc_bytes(raw); return 1; };
+    archive := writer.finish() catch (e) { writer.deinit(); gpa.dealloc_bytes(raw); return 1; };
+
+    source_state := SourceState.{ data = archive, calls = 0, bytes_read = 0, max_request = 0 };
+    source := mz.ZipReadSource.{ ctx = xx @source_state, size = archive.len, read = source_read };
+    owned := mz.open_zip_source(source, false, gpa) catch (e) {
+        gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(raw); return 1;
+    };
+    open_ok := owned.bytes.len < 4096 and source_state.max_request <= 4096 and
+               source_state.bytes_read < 8192 and source_state.calls >= 3;
+
+    source_state.calls = 0; source_state.bytes_read = 0; source_state.max_request = 0;
+    sink_state := SinkState.{ total = 0, checksum = 0 };
+    sink := mz.ZipExtractSink.{ ctx = xx @sink_state, write = sink_write };
+    stored_made := mz.zip_extract_name_to_output(@owned.reader, "large-stored.bin", sink, mz.ZipExtractOptions.{}, payload.len, gpa) catch (e) 0;
+    callback_ok := stored_made == payload.len and sink_state.total == payload.len and
+                   sink_state.checksum == mz.crc32(payload) and source_state.max_request <= 65536;
+
+    source_state.calls = 0; source_state.bytes_read = 0; source_state.max_request = 0;
+    iterator := mz.zip_extract_name_iter(@owned.reader, "large-deflated.bin", mz.ZipExtractOptions.{}, payload.len, gpa) catch (e) {
+        owned.deinit(); gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(raw); return 1;
+    };
+    out_buf : [997]u8 = ---;
+    iterator_total := 0;
+    iterator_crc := 0;
+    while true {
+        made := iterator.read(string.{ ptr = @out_buf[0], len = out_buf.len }) catch (e) {
+            iterator.deinit(); owned.deinit(); gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(raw); return 1;
+        };
+        if made == 0 { break; }
+        iterator_total += made;
+        iterator_crc = mz.crc32(string.{ ptr = @out_buf[0], len = made }, iterator_crc);
+    }
+    iterator.deinit();
+    iterator_ok := iterator_total == payload.len and iterator_crc == mz.crc32(payload) and source_state.max_request <= 65536;
+
+    // The public no-allocation form uses caller-owned destination and input
+    // scratch. Neither tinfl state nor the callback window may allocate.
+    fixed_raw := gpa.alloc_bytes(payload.len);
+    if fixed_raw == null { owned.deinit(); gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(raw); return 1; }
+    fixed := string.{ ptr = xx fixed_raw, len = payload.len };
+    read_scratch : [65536]u8 = ---;
+    deflated_index := owned.reader.find("large-deflated.bin") catch (e) {
+        gpa.dealloc_bytes(fixed_raw); owned.deinit(); gpa.dealloc_bytes(archive.ptr); gpa.dealloc_bytes(raw); return 1;
+    };
+    allocations_before := gpa.alloc_count;
+    fixed_made := owned.reader.extract_into_no_alloc(
+        deflated_index, fixed, mz.ZipExtractOptions.{},
+        string.{ ptr = @read_scratch[0], len = read_scratch.len },
+    ) catch (e) { print("no-alloc error {} zip={}\n", e, owned.reader.peek_last_error()); 0 };
+    no_alloc_ok := fixed_made == payload.len and mz.bytes_equal(fixed, payload) and gpa.alloc_count == allocations_before;
+    if !no_alloc_ok {
+        print("no-alloc detail made={} expected={} bytes={} before={} after={}\n", fixed_made, payload.len, mz.bytes_equal(fixed, payload), allocations_before, gpa.alloc_count);
+    }
+    gpa.dealloc_bytes(fixed_raw);
+
+    owned.deinit();
+    gpa.dealloc_bytes(archive.ptr);
+    gpa.dealloc_bytes(raw);
+    if !open_ok or !callback_ok or !iterator_ok or !no_alloc_ok or gpa.alloc_count != 0 {
+        print("bounded ZIP source failed open={} callback={} iterator={} no_alloc={} leaks={}\n", open_ok, callback_ok, iterator_ok, no_alloc_ok, gpa.alloc_count);
+        return 1;
+    }
+    print("bounded ZIP source initialization and extraction ok\n");
+    0
+}

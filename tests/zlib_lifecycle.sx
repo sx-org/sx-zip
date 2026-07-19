@@ -1,0 +1,84 @@
+#import "modules/std.sx";
+mz :: #import "../miniz.sx";
+
+record :: (out: *mz.ByteWriter, progress: mz.MzProgress, total_in: i64, total_out: i64, adler: i64) {
+    out.put_u32le(progress.status); out.put_u32le(progress.consumed); out.put_u32le(progress.produced);
+    out.put_u32le(total_in); out.put_u32le(total_out); out.put_u32le(adler);
+}
+
+main :: () -> i32 {
+    plain := "zlib lifecycle zlib lifecycle zlib lifecycle zlib lifecycle";
+    output := mz.ByteWriter.init(context.allocator);
+    packed : [4096]u8 = ---;
+
+    deflater : mz.MzDeflateStream = ---;
+    init_status := deflater.init2(6, 8, 15, 9, .filtered, context.allocator);
+    if init_status != mz.MZ_OK { output.deinit(); return 1; }
+    record(@output, mz.MzProgress.{ consumed = 0, produced = 0, status = init_status }, deflater.total_in, deflater.total_out, deflater.adler);
+    progress := deflater.step("", string.{ ptr = @packed[0], len = 0 }, .none);
+    record(@output, progress, deflater.total_in, deflater.total_out, deflater.adler);
+    progress = deflater.step("", string.{ ptr = @packed[0], len = packed.len }, .none);
+    record(@output, progress, deflater.total_in, deflater.total_out, deflater.adler);
+    progress = deflater.step("", string.{ ptr = @packed[deflater.total_out], len = packed.len - deflater.total_out }, .none);
+    record(@output, progress, deflater.total_in, deflater.total_out, deflater.adler);
+    output.put_u32le(deflater.reset());
+    progress = deflater.step(plain, string.{ ptr = @packed[0], len = packed.len }, .finish);
+    record(@output, progress, deflater.total_in, deflater.total_out, deflater.adler);
+    packed_size := deflater.total_out;
+    output.put_u32le(packed_size); output.put_bytes(string.{ ptr = @packed[0], len = packed_size });
+    output.put_u32le(deflater.step("", string.{ ptr = @packed[0], len = packed.len }, .none).status);
+    output.put_u32le(deflater.step("", string.{ ptr = @packed[0], len = packed.len }, .finish).status);
+    output.put_u32le(deflater.end());
+
+    invalid_deflater : mz.MzDeflateStream = ---;
+    output.put_u32le(invalid_deflater.init2(6, 8, 14, 9, .default, context.allocator));
+    output.put_u32le(invalid_deflater.init2(6, 8, 15, 0, .default, context.allocator));
+    odd_level : mz.MzDeflateStream = ---;
+    odd_status := odd_level.init2(99, 8, -15, 9, .fixed, context.allocator);
+    output.put_u32le(odd_status);
+    if odd_status == mz.MZ_OK { output.put_u32le(odd_level.end()); }
+
+    inflater : mz.MzInflateStream = ---;
+    init_status = inflater.init2(15, 4096, context.allocator);
+    output.put_u32le(init_status);
+    if init_status != mz.MZ_OK { output.deinit(); return 1; }
+    decoded : [4096]u8 = ---;
+    progress = inflater.step("", string.{ ptr = @decoded[0], len = decoded.len }, .none);
+    record(@output, progress, inflater.total_in, inflater.total_out, inflater.adler);
+    output.put_u32le(inflater.reset());
+    progress = inflater.step(string.{ ptr = @packed[0], len = packed_size }, string.{ ptr = @decoded[0], len = decoded.len }, .finish);
+    record(@output, progress, inflater.total_in, inflater.total_out, inflater.adler);
+    output.put_u32le(plain.len); output.put_bytes(string.{ ptr = @decoded[0], len = plain.len });
+    output.put_u32le(inflater.step("", string.{ ptr = @decoded[0], len = decoded.len }, .finish).status);
+    output.put_u32le(inflater.reset());
+    progress = inflater.step(string.{ ptr = @packed[0], len = packed_size }, string.{ ptr = @decoded[0], len = 2 }, .finish);
+    record(@output, progress, inflater.total_in, inflater.total_out, inflater.adler);
+    progress = inflater.step(string.{ ptr = @packed[inflater.total_in], len = packed_size - inflater.total_in }, string.{ ptr = @decoded[0], len = decoded.len }, .finish);
+    output.put_u32le(progress.status);
+
+    output.put_u32le(inflater.reset());
+    progress = inflater.step("", string.{ ptr = @decoded[0], len = decoded.len }, .none);
+    record(@output, progress, inflater.total_in, inflater.total_out, inflater.adler);
+    output_at := 0;
+    calls := 0;
+    streaming := true;
+    while streaming and calls < 128 {
+        progress = inflater.step(
+            string.{ ptr = @packed[inflater.total_in], len = packed_size - inflater.total_in },
+            string.{ ptr = @decoded[output_at], len = 2 }, .none);
+        record(@output, progress, inflater.total_in, inflater.total_out, inflater.adler);
+        if progress.produced > 0 { output.put_bytes(string.{ ptr = @decoded[output_at], len = progress.produced }); }
+        output_at += progress.produced;
+        calls += 1;
+        if progress.status == mz.MZ_STREAM_END { streaming = false; }
+    }
+    output.put_u32le(output_at);
+    output.put_u32le(inflater.end());
+    invalid_inflater : mz.MzInflateStream = ---;
+    output.put_u32le(invalid_inflater.init2(14, 4096, context.allocator));
+
+    bytes := output.take();
+    ok := fs.write_file("/tmp/sx-zlib-lifecycle.bin", bytes);
+    context.allocator.dealloc_bytes(bytes.ptr);
+    if ok then 0 else 1
+}
